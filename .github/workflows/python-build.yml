@@ -39,7 +39,18 @@ jobs:
     # pattern openframe-adapters/openframe-core use. Each package needs
     # its own trusted publisher entry at:
     #   https://pypi.org/manage/project/<package-name>/settings/publishing/
+    #
+    # `contents: read` is required here even though this job never writes
+    # to the repo — declaring `permissions:` at all REPLACES the default
+    # token permissions entirely rather than adding to them, so
+    # `id-token: write` alone strips the read access `actions/checkout`
+    # needs, and it fails with a misleading "repository not found" instead
+    # of a permissions error. Confirmed from a real CI run, not assumed —
+    # every `test` job (no `permissions:` override, so it kept the
+    # default `contents: read`) checked out fine in the same run while
+    # every `release` job's checkout failed.
     permissions:
+      contents: read
       id-token: write
 
     steps:
