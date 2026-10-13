@@ -42,10 +42,24 @@ jobs:
           allow-prereleases: true
           cache: pip
 
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      # openframe-protocol-base is not yet published to PyPI (unlike
+      # openframe-core/openframe-adapters-*), so pip can't resolve it as a
+      # dependency of openframe-protocol-http/-grpc on a clean runner —
+      # confirmed by a real CI failure ("No matching distribution found for
+      # openframe-protocol-base"), not assumed. Installing it from this
+      # same checkout first means pip finds the requirement already
+      # satisfied locally and never needs to reach the index for it.
+      # Harmless no-op duplication for the openframe-protocol-base matrix
+      # entry itself.
+      - name: Install openframe-protocol-base from this checkout (not on PyPI yet)
+        working-directory: ${{ github.workspace }}
+        run: pip install -e packages/openframe-protocol-base
+
       - name: Install ${{ matrix.package }} with dev dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+        run: pip install -e ".[dev]"
 
       - name: Run tests
         run: python -m pytest tests/ -v --tb=short

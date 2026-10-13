@@ -4,6 +4,43 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [infra] - 2026-10-13
+
+### Fixed — real CI failure: `app-test.yml` couldn't install `-http`/`-grpc`
+
+A real GitHub Actions run failed `pip install -e ".[dev]"` for
+`openframe-protocol-grpc` with `ERROR: No matching distribution found for
+openframe-protocol-base` — confirmed from the actual CI log, not assumed.
+Cause: `openframe-protocol-base` isn't published to PyPI (unlike
+`openframe-core`/`openframe-adapters-*`), so a clean runner has no way to
+resolve it as a dependency of `-http`/`-grpc`'s own `pyproject.toml`. The
+same problem the Docker-based validation-framework build hit earlier
+(worked around there with local wheels) — CI needed its own fix since
+there's no Docker layer to inject a wheel into.
+
+Fixed in `app-test.yml`: added a step installing `openframe-protocol-base`
+from the same checkout (`pip install -e packages/openframe-protocol-base`)
+before each matrix job's own `pip install -e ".[dev]"` — pip then finds
+the requirement already locally satisfied and never reaches the index for
+it. Harmless no-op duplication for the `openframe-protocol-base` matrix
+entry itself. Verified locally end to end, not just reasoned about: a
+from-scratch venv running the exact same two steps installed
+`openframe-protocol-base` 0.3.0 + `openframe-protocol-grpc` 0.2.0 cleanly,
+26/26 tests passing.
+
+### Added — `.github/requirements/{test,docs}.txt`
+
+Added the local-dev convenience files every sibling repo
+(`openframe-core`/`openframe-adapters`/`openframe-tooling`) already has —
+`test.txt` (aggregates every package's `[dev]` extras so `pytest
+packages/` works from the repo root in one shared environment, not used
+by CI itself) and `docs.txt` (mkdocs toolchain, same versions every other
+repo pins). Verified `pip install -r .github/requirements/test.txt` into
+a from-scratch venv, then `pip install -e` all three packages and
+`pytest packages/` — 109/109 passing.
+
+---
+
 ## [openframe-protocol-http 0.5.0 / openframe-protocol-grpc 0.2.0] - 2026-10-13
 
 ### Added — server/app creation, a boundary M1/M1b deliberately left out
