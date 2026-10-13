@@ -1,0 +1,18 @@
+syntax = "proto3";
+package openframe.protocol.grpc;
+
+// One generic message pair instead of one per route — mirrors server.py's
+// own inspect.Signature trick for HTTP: the wire schema doesn't need to
+// know the domain type, only that a JSON-encoded payload travels inside it.
+// The actual domain type is JSON-encoded inside json_payload.
+message GenericRequest {
+  string json_payload = 1;
+}
+
+message GenericResponse {
+  string json_payload = 1;
+}
+
+service GenericService {
+  rpc Call(GenericRequest) returns (GenericResponse);
+}

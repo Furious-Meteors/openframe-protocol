@@ -1,0 +1,9 @@
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = [
+    "packages/openframe-protocol-base",
+    "packages/openframe-protocol-http",
+    "packages/openframe-protocol-grpc",
+]
+testpaths = ["packages"]
+addopts = "--import-mode=importlib"

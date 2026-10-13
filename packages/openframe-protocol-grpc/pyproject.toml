@@ -1,0 +1,68 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "openframe-protocol-grpc"
+version = "0.2.0"
+description = "OpenFrame Microservice Suite - gRPC server and client binding for openframe.core.inbound/remote."
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+keywords = ["openframe", "protocol", "grpc", "hexagonal", "microservice"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dependencies = [
+    "openframe-core>=3.2.1,<4",
+    "openframe-protocol-base>=0.1,<1",
+]
+
+[project.optional-dependencies]
+server = [
+    "grpcio>=1.60",
+]
+client = [
+    # Unlike HTTP, gRPC's client and server share the same core
+    # dependency — there is no separate "client-only" wire library.
+    "grpcio>=1.60",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-mock>=3.14",
+    "grpcio>=1.60",
+    "grpcio-tools>=1.60",
+    "pydantic>=2.0",
+]
+
+[[project.authors]]
+name = "Furious Meteors Engineering"
+email = "engineering@furiousmeteors.dev"
+
+[[project.maintainers]]
+name = "Furious Meteors Engineering"
+email = "engineering@furiousmeteors.dev"
+
+[project.urls]
+Homepage      = "https://github.com/Furious-Meteors/openframe-protocol"
+Documentation = "https://furious-meteors.github.io/openframe-protocol/"
+Repository    = "https://github.com/Furious-Meteors/openframe-protocol"
+Changelog     = "https://github.com/Furious-Meteors/openframe-protocol/blob/production/.github/CHANGELOG.md"
+"Bug Tracker" = "https://github.com/Furious-Meteors/openframe-protocol/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["openframe"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
