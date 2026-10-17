@@ -38,7 +38,7 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 import grpc
-from pydantic import ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from openframe.core.exceptions import AdapterConnectionError
 from openframe.core.inbound import RequestContext
@@ -103,11 +103,31 @@ def _get_or_create_servicer(server: grpc.aio.Server) -> _RouteRegisteringService
     return servicer
 
 
+def _to_jsonable(value: Any) -> Any:
+    """
+    Recursively converts a handler's result into something `json.dumps`
+    can actually serialise. Needed because handlers built for `-http`
+    (where FastAPI's own response_model machinery already handles this)
+    routinely return `BaseModel` instances or plain containers of them —
+    e.g. `GetItem` returning an `Item`, or `ListItems` returning
+    `{"items": [Item, ...], "total": N}` — and `json.dumps` has no idea
+    what to do with a `BaseModel` on its own.
+    """
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+    if isinstance(value, dict):
+        return {k: _to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_jsonable(v) for v in value]
+    return value
+
+
 def bind_service(
     server: grpc.aio.Server,
     route: str,
     *,
     handler_factory: Callable[[], Any],
+    input_model: Any = None,
     not_found_when: Callable[[Any], bool] | None = None,
 ) -> None:
     """
@@ -130,21 +150,43 @@ def bind_service(
                          Called once per request, no caching, matching
                          `handler_dep`'s own per-request lifecycle in
                          `-http`'s `server.py`.
+        input_model:     The gRPC counterpart of `-http`'s `body_model` —
+                         a real need, not a speculative one: handlers
+                         built for `-http` (e.g. `CreateItem.execute(self,
+                         item: Item, ...)`) expect a validated domain
+                         object, but the decoded `json_payload` is just a
+                         plain dict/list with no casting of its own
+                         (unlike FastAPI, which already validates a
+                         `body_model` before the handler ever sees it).
+                         Any type `pydantic.TypeAdapter` accepts — a
+                         `BaseModel` subclass, `list[Item]`, etc. `None`
+                         (the default) passes the decoded value through
+                         unchanged, for handlers whose input is already a
+                         plain dict/str/int/list of primitives.
         not_found_when:  If the handler's result satisfies this, abort
                          with `NOT_FOUND` instead of returning it.
     """
     servicer = _get_or_create_servicer(server)
+    adapter = TypeAdapter(input_model) if input_model is not None else None
 
     async def _handle(
         request: "generic_pb2.GenericRequest", context: grpc.aio.ServicerContext
     ) -> "generic_pb2.GenericResponse":
         handler = handler_factory()
-        handler_input = json.loads(request.json_payload) if request.json_payload else None
         metadata = dict(context.invocation_metadata())
         request_context: RequestContext = build_request_context(metadata)
         context.set_trailing_metadata((("x-correlation-id", request_context.correlation_id),))
 
         try:
+            raw_input = json.loads(request.json_payload) if request.json_payload else None
+            # Validation errors from an invalid input_model cast go through
+            # the same categorize()/build_envelope() path as a handler's
+            # own exception — matching how FastAPI's RequestValidationError
+            # (from an invalid body_model) categorizes as INVALID on -http,
+            # rather than crashing uncaught before context.abort() runs.
+            handler_input = (
+                adapter.validate_python(raw_input) if adapter is not None and raw_input is not None else raw_input
+            )
             result = await handler.execute(handler_input, request_context)
         except BaseException as exc:
             await _abort_for_exception(context, exc, request_context.correlation_id)
@@ -154,7 +196,7 @@ def bind_service(
             await context.abort(grpc.StatusCode.NOT_FOUND, "not found")
             return  # unreachable
 
-        return generic_pb2.GenericResponse(json_payload=json.dumps(result))
+        return generic_pb2.GenericResponse(json_payload=json.dumps(_to_jsonable(result)))
 
     servicer.register(route, _handle)
 

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "openframe-protocol-grpc"
-version = "0.2.0"
+version = "0.3.0"
 description = "OpenFrame Microservice Suite - gRPC server and client binding for openframe.core.inbound/remote."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -30,6 +30,12 @@ dependencies = [
 [project.optional-dependencies]
 server = [
     "grpcio>=1.60",
+    # bind_service's input_model casting / output serialisation
+    # (TypeAdapter, BaseModel.model_dump) — a real runtime dependency now,
+    # not just a test-only one, since a real handler built for -http
+    # (expecting a validated domain object, not a raw decoded dict) needs
+    # this to work over gRPC at all.
+    "pydantic>=2.0",
 ]
 client = [
     # Unlike HTTP, gRPC's client and server share the same core
