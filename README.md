@@ -1,6 +1,9 @@
 <p align="center">
+  <a href="https://pypi.org/project/openframe-protocol/"><img src="https://img.shields.io/pypi/v/openframe-protocol?color=6DB33F&labelColor=1a1a1a&label=PyPI" alt="PyPI version"/></a>
+  <a href="https://github.com/amrit2356/openframe-protocol"><img src="https://img.shields.io/badge/python-3.11%2B-6DB33F?labelColor=1a1a1a" alt="Python versions"/></a>
   <a href="https://github.com/Furious-Meteors/openframe-protocol/actions/workflows/app-test.yml"><img src="https://img.shields.io/github/actions/workflow/status/Furious-Meteors/openframe-protocol/app-test.yml?branch=production&color=6DB33F&labelColor=1a1a1a&label=tests" alt="Tests"/></a>
   <a href="https://github.com/Furious-Meteors/openframe-protocol/blob/production/LICENSE"><img src="https://img.shields.io/badge/license-MIT-6DB33F?labelColor=1a1a1a" alt="License"/></a>
+  <a href="https://furious-meteors.github.io/openframe-protocol/"><img src="https://img.shields.io/badge/docs-live-6DB33F?labelColor=1a1a1a" alt="Docs"/></a>
 </p>
 
 <p align="center">
