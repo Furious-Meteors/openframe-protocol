@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [openframe-protocol-grpc 0.3.0] - 2026-10-13
+
+### Added — `bind_service(input_model=...)`, found while wiring a real HTTP-built handler over gRPC
+
+Adding a parallel gRPC entrypoint to a real `openframe-local-validation-framework` service
+(sharing the exact same `application/handlers.py` classes the HTTP entrypoint already uses, not
+a gRPC-specific duplicate) surfaced two real gaps `bind_service` never needed before, since
+nothing had actually called it with a handler built for `-http`'s own validated-input
+assumption:
+
+- **Input casting.** A handler like `CreateItem.execute(self, item: Item, ...)` expects a
+  validated domain object. FastAPI's `body_model` already validates before the handler ever
+  sees it; `bind_service`'s decoded `json_payload` was just a plain dict/list with no casting
+  step of its own. `input_model` (any type `pydantic.TypeAdapter` accepts — a `BaseModel`
+  subclass, `list[Item]`, etc.) fixes this; `None` (the default) keeps passing the raw decoded
+  value through unchanged, so every existing call site is unaffected.
+- **Output serialisation.** `json.dumps` has no idea what to do with a `BaseModel` a handler
+  returns on its own (`GetItem` returning an `Item`, `ListItems` returning `{"items": [Item,
+  ...], "total": N}`). Added `_to_jsonable()` — recursively converts `BaseModel`/dict/list
+  results into something `json.dumps` can actually serialise, the gRPC counterpart of
+  `response_model`'s implicit job on `-http`.
+- A validation failure from an invalid `input_model` cast now categorises as
+  `INVALID_ARGUMENT`/`ErrorCategory.INVALID` through the same `categorize()`/`build_envelope()`
+  path a handler's own exception goes through — matching how FastAPI's own
+  `RequestValidationError` categorises, not a separate uncaught crash.
+- `pydantic` moved from `[dev]`-only to a real `[server]` extra runtime dependency —
+  `TypeAdapter`/`BaseModel.model_dump` are no longer just a test-time concern.
+- 5 new tests (`test_bind_service_input_model.py`). Full monorepo suite: 114 passing (up from
+  109).
+
+---
+
 ## [infra] - 2026-10-13
 
 ### Fixed — real CI failure: `app-test.yml` couldn't install `-http`/`-grpc`
