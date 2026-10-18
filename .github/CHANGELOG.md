@@ -4,6 +4,234 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [openframe-protocol-grpc 0.4.0] - 2026-10-18
+
+### Added — `bind_service_stream`, the third `SessionHandler` transport, via `grpc.aio`'s native streaming
+
+`GenericService` gains a second RPC, `CallStream` (`stream GenericRequest` → `stream GenericResponse`),
+alongside the existing unary `Call` — same route-multiplexing trick (`x-openframe-route` metadata),
+regenerated `generic_pb2.py`/`generic_pb2_grpc.py` via `grpc_tools.protoc`, confirmed the existing
+`Call` RPC's generated shape stayed byte-for-byte compatible (31 pre-existing tests still pass
+unchanged). Unlike SSE/WebSocket, this needed **no new library or dependency** — `grpcio` already
+supports all four RPC shapes; this codebase had simply never used the streaming ones until now.
+
+- **`GrpcSession`** — `Session[TOut]` backed by an `asyncio.Queue`, structurally identical to
+  `SseSession`'s own (the servicer method's `yield` loop and the handler are different coroutines
+  that need to hand items between them, same reason SSE needed one).
+- **`bind_service_stream(server, route, *, handler_factory, input_model=None)`** — `on_open` runs
+  (and can reject) before the method's first `yield`, mirroring SSE's pre-`StreamingResponse` and
+  WebSocket's pre-`accept()` commit-point rule, reusing `open_session` unchanged.
+- **A real race SSE/WebSocket never had, found by spiking, not assumed**: `request_iterator`
+  (inbound) and the servicer method's own `yield` loop (outbound) are two independently-scheduled
+  `grpc.aio` signals for the same client disconnect — confirmed across four separate live
+  server/channel spikes that `request_iterator` reliably resolves via plain `StopAsyncIteration`
+  *before* `context.cancelled()` reflects the same disconnect, not a one-off timing fluke.
+  `bind_service_stream` therefore does **not** reuse
+  `openframe.protocol.base.session.run_opened_session` wholesale — inbound dispatch polls
+  `context.cancelled()` for a short window (confirmed needed: a single `asyncio.sleep(0)` tick was
+  NOT enough; the underlying HTTP/2 GOAWAY frame takes a few real milliseconds to process) right
+  after its own loop ends normally, before trusting that as `COMPLETED` rather than
+  `CLIENT_DISCONNECT`.
+- Mid-session `on_event` failures sent in-band via the now-shared `send_error_event`, same as
+  SSE/WebSocket; a reject propagates as a clean `AioRpcError` with zero messages, confirmed by a
+  real spike, mirroring `Call`'s own existing reject path (`_abort_for_exception`, reused unchanged).
+- `SessionConformanceTests` now proven against a **third** real transport (`tests/test_grpc_session_conformance.py`
+  — named to avoid the cross-package `tests/` module-name collision this package's own `conftest.py`
+  already documents, since `openframe-protocol-http` has its own `test_session_conformance.py`).
+- 10 new tests. Full monorepo suite: 174 passing (up from 164).
+
+---
+
+## [openframe-protocol-http 0.8.0] - 2026-10-18
+
+### Added — `bind_webhook`, a one-shot receiver with HMAC signature verification
+
+A new `webhook.py` module inside `-http` (not its own package — per the design spec's own
+placement decision, alongside `sse.py`/`websocket.py`). Deliberately **not** a `SessionHandler`
+transport — a webhook is a one-shot exchange (confirmed by the design spec's own text, §5.5:
+`CommandHandler`/`QueryHandler` already fit webhooks), so `bind_webhook` dispatches to a plain
+`CommandHandler`/`UseCase`, the same contract `bind_command` uses.
+
+- **`bind_webhook(router, path, *, handler_dep, body_model, signature_header, secret, verify, status_code=200)`**
+  — reads the raw request body once, verifies *signature_header*'s value against it with *verify*
+  **before** parsing the body or calling the handler, then parses `body_model` from those same raw
+  bytes (never a re-serialized copy, which wouldn't byte-match what was actually signed).
+- **`verify_hmac_sha256(secret, raw_body, signature, prefix="sha256=")`** — the default verifier,
+  covering the common GitHub/Shopify-style scheme (HMAC-SHA256 over the raw body, hex-encoded,
+  optionally prefixed), using `hmac.compare_digest` for constant-time comparison. Deliberately not
+  universal — a provider with a different scheme (Stripe's timestamp+payload concatenation, for
+  instance) supplies its own `verify` callable.
+- **A missing or invalid signature returns 401 before the handler ever runs** — a sender that can't
+  prove who it is doesn't get to cause a validation error or a handler side effect either. This
+  maps straight to 401, not through `categorize()`/`build_envelope()`: an auth failure specific to
+  this one binder doesn't warrant a new `ErrorCategory` member (none of the existing five draw an
+  authenticated/unauthenticated distinction, and `-base`'s own rule-of-three discipline argues
+  against adding one for a single binder's pre-handler check).
+- **Any error the handler itself raises after signature verification passes still flows through
+  `install_error_handlers`'s normal `categorize`/`build_envelope` path unchanged** — proven with a
+  real `AdapterConnectionError` → 503, confirming the handler actually ran (not short-circuited by
+  the signature check).
+- **A real `TestClient` quirk found and fixed while spiking this, not new but newly hit**: a bare
+  `pydantic.ValidationError` (raised directly by this binder's own `body_model.model_validate_json`
+  call, not by FastAPI's internal body-extraction) is only caught by `install_error_handlers`'s
+  bare `@app.exception_handler(Exception)` when `TestClient(app, raise_server_exceptions=False)` —
+  otherwise it re-raises into the test itself. Same root cause as the conformance driver's own
+  documented `httpx.ASGITransport(raise_app_exceptions=False)` requirement, hit again here in a new
+  binder's own test.
+- 7 new tests. Full monorepo suite: 164 passing (up from 157).
+
+---
+
+## [openframe-protocol-http 0.7.0] - 2026-10-17
+
+### Added — `bind_websocket`, the second `SessionHandler` transport and the first to exercise `on_event`
+
+A new `websocket.py` module inside `-http` (not its own package — Starlette's native WebSocket
+support needs no dependency beyond `[server]`, same as SSE). Unlike SSE, WebSocket is genuinely
+bidirectional: this is the first transport in this repo to actually dispatch inbound events
+through `on_event`.
+
+- **`WebSocketSession`** — `Session[TOut]` backed directly by the Starlette `WebSocket` object (no
+  intermediate queue needed, unlike `SseSession` — `send()` calls the real socket's `send_text()`
+  directly, accepting the connection on first call if `accept()` hasn't happened yet).
+- **`bind_websocket(router, path, *, handler_factory)`** — `on_open` always runs, and can reject,
+  *before* `accept()`, mirroring SSE's own commit-point timing rule but for a handshake instead of
+  a response's headers. Confirmed with a real spike (`TestClient.websocket_connect`): calling
+  `websocket.close()` before `accept()` produces a genuine failed handshake the client sees as
+  `WebSocketDisconnect` on connect, not a message after connecting.
+- **`WebSocketDisconnect` → `asyncio.CancelledError` translation**: `run_opened_session`
+  (`openframe-protocol-base`) only special-cases `CancelledError` for disconnect handling — it has
+  no Starlette dependency of its own. `bind_websocket`'s `inbound_events()` generator re-raises a
+  real client disconnect as `CancelledError` instead of letting `WebSocketDisconnect` propagate
+  unmapped, so the existing generic handling applies unchanged.
+- **A real race found and fixed while spiking this**: a handler that closes the session itself
+  from inside `on_event` (not a client disconnect) left the inbound loop's next `receive_text()`
+  call hitting an already-closed socket, raising `WebSocketDisconnected` (a *different* exception
+  than `WebSocketDisconnect`, confirmed by the actual traceback) — unmapped, this surfaced as
+  `CloseReason.ERROR` instead of `COMPLETED`. Fixed by checking the session's closed state before
+  each receive, ending the generator normally instead.
+- **A test-harness-only limitation found and worked around, not a `bind_websocket` bug**:
+  `TestClient.websocket_connect` does not service an orphan `asyncio.create_task` the way a real
+  server does — a background-task-pushing handler hung forever under `TestClient` but worked
+  correctly when verified against a real `uvicorn.Server` with a real `websockets`-library client
+  (confirmed directly, not assumed). `SessionConformanceTests`'s own WebSocket driver uses a
+  client-triggered close pattern instead, which `TestClient` can actually test.
+- `SessionConformanceTests` (from `-base`) now proven against a *second* real transport — all 6
+  pass, alongside SSE's own 6.
+- 16 new tests. Full monorepo suite: 157 passing (up from 146).
+- **Not done as part of this**: nothing else in the M3 milestone (webhooks, MCP) — WebSocket was
+  the last transport this plan called for.
+
+---
+
+## [openframe-protocol-http 0.6.0] - 2026-10-17
+
+### Added — `bind_session` (SSE), the first real `SessionHandler` transport
+
+Built on `openframe-protocol-base` 0.4.0's `open_session`/`run_opened_session`/
+`send_error_event`. A new `sse.py` module inside `-http` (not a new
+package), per the design spec's own placement decision — SSE has no
+handshake beyond a normal HTTP GET.
+
+- **`SseSession`** — `Session[TOut]` backed by an `asyncio.Queue`; `send()`
+  enqueues, `close()` enqueues a sentinel and records the *first* reason
+  it was called with.
+- **`bind_session(router, path, *, handler_factory)`** — calls
+  `open_session` (accept/reject) **before** constructing the
+  `StreamingResponse`, confirmed necessary by actually tracing Starlette's
+  `StreamingResponse.stream_response`: it sends the ASGI
+  `http.response.start` message (status 200) before ever pulling the body
+  generator's first item, so a reject decided inside the generator would
+  already be too late. A reject now propagates straight out of the route
+  function into `install_error_handlers`'s normal `categorize`/
+  `build_envelope` → status-code path — proven with a real
+  `AdapterTimeoutError` → 504 response, not assumed. Sets
+  `X-Correlation-ID` on the response, matching `bind_query`/
+  `bind_command`'s own convention.
+- **Deliberately does not use `run_opened_session`** — SSE has no inbound
+  events at all (`on_event` is never called), so there's nothing for it
+  to dispatch. An SSE handler drives its own background production after
+  `on_open` returns and reports its own failures via the now-public
+  `send_error_event` directly.
+- **Spiked against real infrastructure, not just `httpx.ASGITransport`**:
+  confirmed the hard way that `ASGITransport` does not simulate a real
+  client disconnect at all (no parallel `http.disconnect`-watcher task
+  the way a real server has) — an early version of the disconnect test
+  hung forever. Rewrote it against a real `uvicorn.Server` and a real
+  socket close instead; `uvicorn>=0.30` added as a `[dev]`-only
+  dependency for this. Proven: ordered multi-event delivery over one
+  connection, reject → mapped HTTP error (not a broken stream), mid-session
+  failure → in-band error event with no message leak, and real client
+  disconnect → `on_close(CLIENT_DISCONNECT)`.
+- `SessionConformanceTests` (from `-base`) now also proven against this
+  real transport, not just the in-process fake — all 6 pass.
+- `openframe-protocol-base` floor bumped to `>=0.1,<1` (unchanged —
+  already covers 0.4.0).
+- 11 new tests. Full monorepo suite: 146 passing (up from 135).
+- **Not done as part of this**: WebSocket — its own package-boundary
+  question (still `[verify]` in the design spec) and genuinely
+  bidirectional, unlike SSE. Next step once this is reviewed.
+
+---
+
+## [openframe-protocol-base 0.4.0] - 2026-10-17
+
+### Added — `run_session` + `SessionConformanceTests`, the session-lifecycle counterpart to `TransportConformanceTests`
+
+Built on `openframe-core` 3.8.0's new `SessionHandler`/`Session`/`CloseReason`
+(ADR-008) — the driving-side contract for long-lived connections
+(WebSocket, SSE), added directly to core rather than incubated here first
+(see that ADR's "Why skip incubation" section).
+
+- **`open_session(handler, session)` + `run_opened_session(handler, session,
+  inbound_events)`** (`session.py`) — the open/dispatch/error/close state
+  machine every session transport's `server.py` reuses, the
+  session-lifecycle sibling of `create_app`/`create_server` (M1c).
+  `run_session(...)` is a convenience wrapper combining both, correct
+  only when there's no wire "commit point" to worry about. Two failure
+  points, two different wire treatments — found while designing this,
+  not assumed: an `on_open` rejection propagates out of `open_session`
+  (nothing committed to the wire yet — the transport maps it through the
+  usual `categorize`/`build_envelope` status-code path), while an
+  `on_event` failure mid-session (`run_opened_session`) is sent
+  **in-band** via `session.send()` (the stream already committed by
+  then, no status code left to change) and does not propagate.
+  `asyncio.CancelledError` is reported as `CloseReason.CLIENT_DISCONNECT`
+  and always re-raised — standard cancellation hygiene, never swallowed.
+  `on_close`/`session.close()` always fire exactly once for the path
+  taken, including when `on_open` itself failed.
+  **`open_session`/`run_opened_session` were split from one single
+  `run_session` function mid-build**, confirmed by tracing Starlette's
+  own `StreamingResponse.stream_response`: it sends the ASGI
+  `http.response.start` message (status + headers) before ever pulling
+  the body generator's first item — so a reject decided *inside* a
+  generator would already be too late to turn into a real 4xx/5xx. A
+  transport with a commit-point distinction (SSE, WebSocket) must call
+  `open_session` before constructing its `StreamingResponse`/completing
+  its handshake, then `run_opened_session` after.
+- **`SessionResult`/`SessionDriver`/`SessionConformanceTests`**
+  (`session_testing.py`, its own module, not added to the existing
+  `testing.py` — the two suites share no scenarios) — covers exactly what
+  the design spec's session section specifies: open/reject, ordered
+  delivery, clean close, abrupt disconnect, and correlation id stability
+  across the session's whole lifetime. Proven against a real in-process
+  driver running real handlers through the real `run_session`/
+  `InMemorySession` (`tests/test_session_testing.py`), not just hand-built
+  result objects — doubles as an integration test of `run_session` itself.
+  Promotion to `openframe.core.testing` gated on two session transports
+  (SSE, WebSocket) passing this suite for real, same rule-of-three
+  discipline as `TransportConformanceTests`.
+- `openframe-core` floor bumped to `>=3.2.1,<4` (unchanged — already
+  covers 3.8.0).
+- 21 new tests. Full monorepo suite: 135 passing (up from 114).
+- **Not done as part of this**: any real session transport implementing
+  `SessionHandler`/calling `run_session` — this built and proved the
+  generic plumbing, not yet a transport. SSE (inside
+  `openframe-protocol-http`, per the design spec's own placement
+  decision) is next.
+
+---
+
 ## [openframe-protocol-grpc 0.3.0] - 2026-10-13
 
 ### Added — `bind_service(input_model=...)`, found while wiring a real HTTP-built handler over gRPC
