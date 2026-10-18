@@ -15,17 +15,25 @@
 ---
 
 `openframe-protocol` is the communication-protocol family of the OpenFrame Microservice
-Development Suite — HTTP and gRPC today, with MCP, SSE/WebSocket, and the rest of the roadmap
-gated on demonstrated need (see `openframe-protocol-design.md` section 0). Every binding package
-follows the same two-file schema: `server.py` (bind a `UseCase`/`CommandHandler`/`QueryHandler`
-from `openframe.core.inbound` to an inbound route) and `client.py` (call another service built on
-this platform) — split by `[server]`/`[client]` extras so installing one never drags in the
-other's dependency.
+Development Suite — HTTP, gRPC, SSE, WebSocket, and webhooks today, with MCP and the rest of the
+roadmap gated on demonstrated need (see `openframe-protocol-design.md` section 0). Every
+request/response binding package follows the same two-file schema: `server.py` (bind a
+`UseCase`/`CommandHandler`/`QueryHandler` from `openframe.core.inbound` to an inbound route) and
+`client.py` (call another service built on this platform) — split by `[server]`/`[client]` extras
+so installing one never drags in the other's dependency. Webhooks are a one-shot exchange, the
+same `CommandHandler`/`UseCase` shape — `bind_webhook` just adds HMAC signature verification
+against the raw body before the handler runs; see
+[Webhooks — HMAC signature verification](#webhooks--hmac-signature-verification) below. Long-lived
+connections (SSE, WebSocket, and gRPC's own `CallStream`) use a different contract —
+`SessionHandler` (ADR-008, `openframe-core`) — since they aren't one-request-in/one-response-out;
+see
+[Session transports — SSE, WebSocket, gRPC streaming, and the SessionHandler contract](#session-transports--sse-websocket-grpc-streaming-and-the-sessionhandler-contract)
+below.
 
 Not yet published to PyPI — install from this repo directly (editable installs of the sibling
 packages, or build local wheels) until a first release ships. `openframe-protocol-base` is at
-**0.3.0**, `openframe-protocol-http` at **0.5.0**, `openframe-protocol-grpc` at **0.3.0**. All
-three develop and test against `openframe-core>=3.2.1,<4`.
+**0.4.0**, `openframe-protocol-http` at **0.8.0**, `openframe-protocol-grpc` at **0.4.0**. All
+three develop and test against `openframe-core>=3.2.1,<4` (`openframe-core` itself is at **3.8.0**).
 
 Both transports can run **concurrently in one process, over the same business logic** — a real
 service in `openframe-local-validation-framework` serves HTTP and gRPC side by side, sharing the
@@ -71,9 +79,9 @@ pip install "openframe-protocol[all]"     # every transport package, base includ
 
 | Extra | Package | Status | Depends on |
 |---|---|---|---|
-| (default) | `openframe-protocol-base` | **0.3.0** — error mapping, `RequestContext` construction, both conformance suites | `openframe-core` |
-| `[http]` | `openframe-protocol-http` | **0.5.0** — `bind_query`/`bind_command`/`create_app` (`[server]`), `HttpRemoteQueryClient`/`HttpRemoteCommandClient` (`[client]`) | `openframe-protocol-base` |
-| `[grpc]` | `openframe-protocol-grpc` | **0.3.0** — `bind_service`/`create_server` (`[server]`), `GrpcRemoteQueryClient`/`GrpcRemoteCommandClient` (`[client]`) | `openframe-protocol-base` |
+| (default) | `openframe-protocol-base` | **0.4.0** — error mapping, `RequestContext` construction, request/response + session conformance suites, `open_session`/`run_opened_session`/`send_error_event` | `openframe-core` |
+| `[http]` | `openframe-protocol-http` | **0.8.0** — `bind_query`/`bind_command`/`create_app`/`bind_session`/`bind_websocket`/`bind_webhook` (`[server]`), `HttpRemoteQueryClient`/`HttpRemoteCommandClient` (`[client]`) | `openframe-protocol-base` |
+| `[grpc]` | `openframe-protocol-grpc` | **0.4.0** — `bind_service`/`bind_service_stream`/`create_server` (`[server]`), `GrpcRemoteQueryClient`/`GrpcRemoteCommandClient` (`[client]`) | `openframe-protocol-base` |
 
 `TransportConformanceTests` and `RemoteClientConformanceTests` (`openframe-protocol-base`) both
 pass for real against **two** transports — the rule-of-three bar the project's own design spec
@@ -234,16 +242,16 @@ shutdown. Neither function decides what `on_startup`/`on_shutdown` actually do �
 service's own composition root, built from whichever `openframe-adapters` plugins it needs:
 
 ```python
-# src/entrypoints/http/main.py
+# src/main.py — HTTP-only service (no gRPC entrypoint needed)
 from openframe.protocol.http import create_app
-from src.bootstrap import dependencies
-from src.entrypoints.http.routes import router
+from src import pipeline
+from src.api.http.routes import router
 
 app = create_app(
     title="items-service",
     description="Items over Postgres",
-    on_startup=dependencies.initialise,    # ApplicationBootstrap.start() underneath
-    on_shutdown=dependencies.shutdown,
+    on_startup=pipeline.initialise,    # ApplicationBootstrap.start() underneath
+    on_shutdown=pipeline.shutdown,
     routers=[router],
 )
 
@@ -263,19 +271,24 @@ where those calls belong. See the design spec's draft 11 for the full reasoning.
 ## Multiple entrypoints — HTTP and gRPC together
 
 Both transports can serve the same business logic concurrently, in one process — a real,
-Docker-validated pattern, not a toy. The same `application/handlers.py` classes a service already
-built for HTTP are reused unmodified for gRPC; only the route binding differs:
+Docker-validated pattern, not a toy. The same `core/handlers.py` classes a service already built
+for HTTP are reused unmodified for gRPC; only the route binding (`api/http/routes.py` vs.
+`api/rpc/routes.py`) differs. Which transports actually run is a runtime toggle
+(`EntrypointSettings`'s `ENABLE_HTTP`/`ENABLE_GRPC`, both default `true`), not a code fork:
 
 ```python
-# src/entrypoints/main.py — combined process entrypoint
+# src/main.py — single process entrypoint
 import asyncio
+from contextlib import AsyncExitStack
+
 import uvicorn
 from openframe.protocol.grpc import create_server
 from openframe.protocol.http import create_app
 
-from src.bootstrap import dependencies
-from src.entrypoints.grpc.routes import configure as configure_grpc
-from src.entrypoints.http.routes import router as http_router
+from src import pipeline
+from src.api.http.routes import router as http_router
+from src.api.rpc.routes import configure as configure_grpc
+from src.utils.config import EntrypointSettings
 
 
 async def _noop() -> None:
@@ -283,31 +296,41 @@ async def _noop() -> None:
 
 
 async def main() -> None:
-    # Startup/shutdown called exactly ONCE here, shared by both transports —
-    # create_app/create_server each get a no-op hook instead. Calling
-    # dependencies.initialise()/shutdown() twice (once per transport) would
-    # double-initialise the plugin registry and orphan the first instance.
-    await dependencies.initialise()
-    try:
-        app = create_app(title="items-service", on_startup=_noop, on_shutdown=_noop, routers=[http_router])
-        http_server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=8001))
+    settings = EntrypointSettings()
 
-        async with create_server(
-            address="[::]:50051", configure=configure_grpc, on_startup=_noop, on_shutdown=_noop,
-        ) as grpc_server:
+    # Startup/shutdown called exactly ONCE here, shared by whichever
+    # transports are enabled — create_app/create_server each get a no-op
+    # hook instead. Calling pipeline.initialise()/shutdown() per transport
+    # would double-initialise the plugin registry and orphan the first
+    # instance.
+    await pipeline.initialise()
+    try:
+        async with AsyncExitStack() as stack:
+            tasks: dict[str, asyncio.Task] = {}
+
+            if settings.enable_http:
+                app = create_app(title="items-service", on_startup=_noop, on_shutdown=_noop, routers=[http_router])
+                http_server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=settings.http_port))
+                tasks["http"] = asyncio.create_task(http_server.serve())
+
+            if settings.enable_grpc:
+                grpc_server = await stack.enter_async_context(
+                    create_server(address=settings.grpc_address, configure=configure_grpc,
+                                  on_startup=_noop, on_shutdown=_noop)
+                )
+                tasks["grpc"] = asyncio.create_task(grpc_server.wait_for_termination())
+
             # Not gather(): both coroutines run indefinitely, so if only one
             # receives a shutdown signal, asyncio.wait(FIRST_COMPLETED) lets
             # it explicitly stop the other — gather() would hang forever.
-            http_task = asyncio.create_task(http_server.serve())
-            grpc_task = asyncio.create_task(grpc_server.wait_for_termination())
-            _done, pending = await asyncio.wait({http_task, grpc_task}, return_when=asyncio.FIRST_COMPLETED)
-            if grpc_task in pending:
+            _done, pending = await asyncio.wait(tasks.values(), return_when=asyncio.FIRST_COMPLETED)
+            if "grpc" in tasks and tasks["grpc"] in pending:
                 await grpc_server.stop(grace=5)
-            if http_task in pending:
+            if "http" in tasks and tasks["http"] in pending:
                 http_server.should_exit = True
-                await http_task
+                await tasks["http"]
     finally:
-        await dependencies.shutdown()
+        await pipeline.shutdown()
 
 
 if __name__ == "__main__":
@@ -334,13 +357,130 @@ bind_service(server, "update_status", handler_factory=lambda: _UpdateStatusAdapt
 
 ---
 
+## Session transports — SSE, WebSocket, gRPC streaming, and the `SessionHandler` contract
+
+HTTP and gRPC's unary `Call` are both request/response: one input in, one output out. A long-lived
+connection (SSE, WebSocket, gRPC's own `CallStream`) doesn't fit that shape — a handler may send
+zero or many events over a connection's lifetime, and (for WebSocket and gRPC streaming, both
+genuinely bidirectional) receive zero or many inbound events too.
+`openframe.core.inbound.SessionHandler[TIn, TOut]` (ADR-008) is the contract for that:
+
+```python
+class ArtifactUpdates:
+    async def on_open(self, session: Session[dict]) -> None:
+        # Accept by returning normally; reject by raising — the exception
+        # flows through the same categorize()/build_envelope() path a
+        # request/response failure does.
+        async def _produce():
+            async for artifact in watch_artifact_changes():
+                await session.send(artifact.model_dump())
+            await session.close()
+        asyncio.create_task(_produce())
+
+    async def on_event(self, session: Session[dict], event) -> None:
+        ...  # never called for SSE (no client-to-server events) — actually
+             # fires for WebSocket, the one transport where this matters
+
+    async def on_close(self, session, reason: CloseReason) -> None:
+        ...  # called exactly once, however the session ended
+```
+
+`openframe.protocol.http.bind_session` (SSE) and `bind_websocket` (WebSocket) are modules of
+`-http`, not separate packages — neither needs a dependency beyond `[server]` (FastAPI), since
+Starlette's own `StreamingResponse` and `WebSocket` support cover both.
+`openframe.protocol.grpc.bind_service_stream` is gRPC's own counterpart, needing **no new
+dependency at all** — `grpcio` already supports bidirectional streaming natively, via a second RPC
+(`CallStream`) alongside the existing unary `Call`:
+
+```python
+from openframe.protocol.http import bind_session, bind_websocket
+from openframe.protocol.grpc import bind_service_stream
+
+bind_session(router, "/artifacts/stream", handler_factory=lambda: ArtifactUpdates())
+bind_websocket(router, "/artifacts/ws", handler_factory=lambda: ArtifactUpdates())
+bind_service_stream(grpc_server, "artifact_updates", handler_factory=lambda: ArtifactUpdates())
+```
+
+Real findings from building all three, confirmed by testing against actual framework/infrastructure
+behaviour, not assumed:
+
+- **Accept/reject must happen before the connection commits, not inside it.** For SSE, Starlette's
+  `StreamingResponse` sends the HTTP status (200) before ever pulling the body generator's first
+  item; for WebSocket, calling `websocket.close()` before `accept()` produces a real failed
+  handshake rather than a post-connect message. Both confirmed by tracing/spiking directly. So
+  `on_open` always runs — and can reject — before that commit point; a reject propagates into
+  `install_error_handlers`'s normal `categorize`/`build_envelope` mapping for SSE, or a real closed
+  handshake for WebSocket — never a connection that already looked successful before failing.
+- **A failure *after* the connection has committed** (SSE's background production, or a
+  WebSocket's `on_event`) has no status code or handshake left to change — it's sent **in-band**,
+  via `session.send()`, as a plain `{"error": {...}}` dict, using the now-public
+  `openframe.protocol.base.send_error_event`.
+- **WebSocket's `WebSocketDisconnect` is translated to `asyncio.CancelledError`** so the
+  transport-neutral `run_opened_session` (which only knows about `CancelledError`, not Starlette)
+  can report a real client disconnect correctly without this package needing a Starlette
+  dependency of its own.
+- **`TestClient.websocket_connect` doesn't service an orphan `asyncio.create_task`** the way a
+  real server does — found while testing a background-task-pushing WebSocket handler, confirmed
+  harmless (and the pattern confirmed working) by verifying the same handler against a real
+  `uvicorn.Server` instead. A test-harness limitation, not a `bind_websocket` bug.
+- **gRPC's streaming has a real race SSE/WebSocket never had**: the inbound `request_iterator` and
+  the servicer method's own outbound `yield` loop are two *independently-scheduled* `grpc.aio`
+  signals for the same client disconnect. Confirmed across four live spikes that `request_iterator`
+  reliably ends via plain `StopAsyncIteration` *before* `context.cancelled()` reflects the same
+  disconnect — not a one-off timing fluke. Fixed by polling `context.cancelled()` for a short window
+  (a single `asyncio.sleep(0)` tick was confirmed not enough — the underlying HTTP/2 GOAWAY frame
+  takes a few real milliseconds to process) before trusting "inbound ended" as a graceful finish.
+
+See ADR-008 in `openframe-core` for the full contract design (including why outbound events are
+push-based — `session.send()` — rather than a pull-based `AsyncIterator` return value), and
+`openframe-protocol-base`'s `SessionConformanceTests` for the suite all three session transports
+prove themselves against (open/reject, ordered delivery, clean close, abrupt disconnect,
+correlation id stability).
+
+---
+
+## Webhooks — HMAC signature verification
+
+A webhook is a one-shot exchange — one HTTP POST in, one ack out — the same shape
+`CommandHandler`/`UseCase` already fit, confirmed by this repo's own design spec (§5.5). It's
+**not** a `SessionHandler` transport. The one thing a webhook receiver needs that `bind_command`
+doesn't provide: proving the payload actually came from the claimed sender, which needs the raw
+request bytes, not a re-serialized parse of them.
+
+```python
+from openframe.protocol.http import bind_webhook
+
+bind_webhook(
+    router,
+    "/webhooks/orders",
+    handler_dep=get_order_paid_handler,
+    body_model=OrderPaid,
+    signature_header="X-Hub-Signature-256",
+    secret=settings.webhook_secret,
+)
+```
+
+`verify_hmac_sha256` (the default `verify`) covers the common GitHub/Shopify-style scheme:
+HMAC-SHA256 over the raw body, hex-encoded, optionally prefixed (`"sha256=..."`), compared with
+`hmac.compare_digest` (constant-time, not a timing-attack-prone `==`). A provider with a different
+scheme (Stripe's timestamp+payload concatenation, for instance) supplies its own `verify` callable.
+
+A missing or invalid signature returns 401 **before** the body is parsed or the handler runs — a
+sender that can't prove who it is doesn't get to cause a validation error or a handler side effect
+either. This maps straight to 401, not through `categorize()`/`build_envelope()`: an auth failure
+specific to this one binder doesn't warrant a new `ErrorCategory` member. Any error the *handler*
+itself raises after the signature check passes still flows through `install_error_handlers`'s
+normal path unchanged — proven with a real `AdapterConnectionError` → 503.
+
+---
+
 ## Ecosystem
 
 | Package | Install | Description |
 |---|---|---|
 | [`openframe-core`](https://github.com/Furious-Meteors/openframe-core) | `pip install openframe-core` | Ports · tracing · telemetry · exceptions · config |
 | [`openframe-adapters`](https://github.com/Furious-Meteors/openframe-adapters) | `pip install openframe-adapters[postgres]` | Database and queue adapters — Postgres, Mongo, Redis, Kafka, and more |
-| `openframe-protocol` | `pip install "openframe-protocol[http]"` | HTTP · gRPC today — MCP, SSE/WebSocket, media protocols on demonstrated need |
+| `openframe-protocol` | `pip install "openframe-protocol[http]"` | HTTP · gRPC · SSE · WebSocket · webhooks today — MCP, media protocols on demonstrated need |
 | `openframe-infra` | — | Storage · auth · secrets · observability · feature flags (not yet built) |
 | `openframe-ai` | — | LangChain · LlamaIndex · CrewAI · model serving · training (not yet built) |
 
