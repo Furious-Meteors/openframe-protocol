@@ -3,9 +3,10 @@ openframe.protocol.base
 ==========================
 Shared, transport-neutral mechanics every `openframe-protocol-*` binding
 builds on: error categorisation (`errors.py`), `RequestContext`
-construction (`context.py`), and the inbound conformance suite
-(`testing.py`). No transport dependencies — a binding package depends on
-this one, never the reverse.
+construction (`context.py`), the inbound request/response conformance
+suite (`testing.py`), the session-lifecycle loop (`session.py`), and its
+own conformance suite (`session_testing.py`). No transport dependencies —
+a binding package depends on this one, never the reverse.
 
 .. stability: experimental
 """
@@ -18,6 +19,17 @@ from openframe.protocol.base.errors import (
     build_envelope,
     categorize,
     raise_for_envelope,
+)
+from openframe.protocol.base.session import (
+    open_session,
+    run_opened_session,
+    run_session,
+    send_error_event,
+)
+from openframe.protocol.base.session_testing import (
+    SessionConformanceTests,
+    SessionDriver,
+    SessionResult,
 )
 from openframe.protocol.base.testing import (
     UNEXPECTED_ERROR_SECRET,
@@ -41,4 +53,11 @@ __all__ = [
     "UNEXPECTED_ERROR_SECRET",
     "RemoteClientDriver",
     "RemoteClientConformanceTests",
+    "open_session",
+    "run_opened_session",
+    "run_session",
+    "send_error_event",
+    "SessionResult",
+    "SessionDriver",
+    "SessionConformanceTests",
 ]

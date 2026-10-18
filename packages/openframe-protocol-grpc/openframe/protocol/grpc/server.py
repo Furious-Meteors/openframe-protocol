@@ -27,11 +27,48 @@ propagates to the client as `AioRpcError.code()`/`.details()`, and
 headers — so `build_request_context` (built for a header-like `Mapping`)
 works unchanged here, no gRPC-specific context builder needed.
 
+`bind_service_stream` + `GrpcSession` — the `SessionHandler` (ADR-008)
+binding, `CallStream`'s bidirectional-streaming counterpart to `Call`.
+Several real spikes against a live `grpc.aio` server/channel confirmed,
+not assumed: (1) `context.abort()` before the first `yield` produces a
+clean client-side error with zero messages, same as `Call`'s own reject
+path; (2) `invocation_metadata()` is readable before consuming
+`request_iterator`, so `build_request_context` still runs exactly once
+per session; (3) a genuine abrupt disconnect reliably flips
+`context.cancelled()` to `True` — but only after a real, confirmed
+propagation delay (the underlying HTTP/2 GOAWAY frame being processed; a
+single `asyncio.sleep(0)` tick was confirmed NOT enough, a ~100ms poll
+was); (4) **a real race SSE/WebSocket never had**: `request_iterator`
+(inbound) and the method's own `yield` loop (outbound) are two
+independently-scheduled signals for the same disconnect, and
+`request_iterator` reliably (not just occasionally) resolves via plain
+`StopAsyncIteration` *before* `context.cancelled()` reflects the same
+disconnect — confirmed consistent across multiple spike shapes, not a
+one-off timing fluke. Because of (4), `bind_service_stream` does **not**
+reuse `openframe.protocol.base.session.run_opened_session` wholesale —
+it still uses `open_session` (confirmed correct for the pre-yield reject
+timing), but the inbound dispatch task itself polls `context.cancelled()`
+for a short window right after its own loop ends normally, before
+trusting that as `CloseReason.COMPLETED` rather than
+`CloseReason.CLIENT_DISCONNECT` (see finding 3) — then calls
+`session.close()` itself either way, so the outer `yield`-loop's own
+sentinel-wait unblocks. The outer loop's own `except asyncio.CancelledError`
+remains as a second, independent path for a disconnect that reaches
+*it* directly (reading `session.close_reason` back out afterward — the
+same pattern already proven for SSE's own `bind_session`, for the same
+reason: a self-closing handler's reason must survive being read back
+after the fact). `SseSession`/`bind_session` already don't use
+`run_opened_session` either (no inbound events at all) — gRPC is a
+second, differently-shaped case where the shared primitive's ownership
+model doesn't fit, confirmed by testing, not assumed.
+
 Dependency order:
-    protocol/grpc/server → protocol/base (errors, context), protocol/grpc (generic_pb2*)
+    protocol/grpc/server → protocol/base (errors, context, session), protocol/grpc (generic_pb2*)
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -41,13 +78,14 @@ import grpc
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from openframe.core.exceptions import AdapterConnectionError
-from openframe.core.inbound import RequestContext
+from openframe.core.inbound import CloseReason, RequestContext, SessionHandler
 from openframe.core.telemetry import record_error, record_lifecycle_event, setup_telemetry, shutdown_telemetry
 from openframe.protocol.base.context import build_request_context
 from openframe.protocol.base.errors import ErrorCategory, build_envelope, categorize
+from openframe.protocol.base.session import open_session, send_error_event
 from openframe.protocol.grpc import generic_pb2, generic_pb2_grpc
 
-__all__ = ["bind_service", "ROUTE_METADATA_KEY", "create_server"]
+__all__ = ["bind_service", "bind_service_stream", "GrpcSession", "ROUTE_METADATA_KEY", "create_server"]
 
 _logger = logging.getLogger(__name__)
 
@@ -65,15 +103,26 @@ ROUTE_METADATA_KEY = "x-openframe-route"
 class _RouteRegisteringServicer(generic_pb2_grpc.GenericServiceServicer):
     """
     One servicer instance per `grpc.aio.Server`, holding every route
-    `bind_service` has registered on it so far — the gRPC equivalent of
-    an `APIRouter` accumulating routes before `app.include_router()`.
+    `bind_service`/`bind_service_stream` has registered on it so far —
+    the gRPC equivalent of an `APIRouter` accumulating routes before
+    `app.include_router()`.
+
+    Two separate route tables — `Call` (unary) and `CallStream`
+    (bidirectional streaming) are different RPC methods on the same
+    `GenericService`, each with its own `x-openframe-route` namespace;
+    nothing stops a service from binding the same route name to both
+    (they're independent dispatch tables, not a shared one).
     """
 
     def __init__(self) -> None:
         self._routes: dict[str, Callable[[Any, grpc.aio.ServicerContext], Any]] = {}
+        self._stream_routes: dict[str, Callable[[Any, grpc.aio.ServicerContext], Any]] = {}
 
     def register(self, route: str, handler: Callable[[Any, grpc.aio.ServicerContext], Any]) -> None:
         self._routes[route] = handler
+
+    def register_stream(self, route: str, handler: Callable[[Any, grpc.aio.ServicerContext], Any]) -> None:
+        self._stream_routes[route] = handler
 
     async def Call(
         self, request: "generic_pb2.GenericRequest", context: grpc.aio.ServicerContext
@@ -85,6 +134,18 @@ class _RouteRegisteringServicer(generic_pb2_grpc.GenericServiceServicer):
             await context.abort(grpc.StatusCode.NOT_FOUND, f"no route bound for {route!r}")
             return  # unreachable: abort() always raises
         return await handler(request, context)
+
+    async def CallStream(
+        self, request_iterator: AsyncIterator["generic_pb2.GenericRequest"], context: grpc.aio.ServicerContext
+    ) -> AsyncIterator["generic_pb2.GenericResponse"]:
+        metadata = dict(context.invocation_metadata())
+        route = metadata.get(ROUTE_METADATA_KEY)
+        handler = self._stream_routes.get(route)
+        if handler is None:
+            await context.abort(grpc.StatusCode.NOT_FOUND, f"no stream route bound for {route!r}")
+            return  # unreachable: abort() always raises
+        async for response in handler(request_iterator, context):
+            yield response
 
 
 def _get_or_create_servicer(server: grpc.aio.Server) -> _RouteRegisteringServicer:
@@ -199,6 +260,173 @@ def bind_service(
         return generic_pb2.GenericResponse(json_payload=json.dumps(_to_jsonable(result)))
 
     servicer.register(route, _handle)
+
+
+_STREAM_SENTINEL = object()
+
+
+class GrpcSession:
+    """
+    `Session[TOut]` backed by an `asyncio.Queue` — `send()` enqueues, the
+    `CallStream` servicer method's own generator loop (`bind_service_stream`)
+    dequeues and yields a `GenericResponse`. Structurally identical to
+    `openframe.protocol.http.sse.SseSession`'s own queue — needed for the
+    same reason: the handler (via `on_open`/`on_event`, possibly from a
+    background task) and the generator loop `grpc.aio` actually drives are
+    two different coroutines that need to hand items between them.
+
+    `close()` is idempotent and records the *first* reason it was called
+    with, in :attr:`close_reason` — `bind_service_stream` reads this back
+    after its own loop ends, rather than tracking a separate local
+    variable, since more than one path (the handler itself, a dispatch
+    error, or a confirmed client disconnect) can be the one that actually
+    decided the session was over.
+    """
+
+    def __init__(self, *, context: RequestContext) -> None:
+        self.context = context
+        self._queue: "asyncio.Queue[Any]" = asyncio.Queue()
+        self._closed = False
+        self.close_reason: CloseReason | None = None
+
+    async def send(self, event: Any) -> None:
+        if self._closed:
+            raise RuntimeError("cannot send on a closed session")
+        await self._queue.put(event)
+
+    async def close(self, reason: CloseReason = CloseReason.COMPLETED) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.close_reason = reason
+        await self._queue.put(_STREAM_SENTINEL)
+
+
+def bind_service_stream(
+    server: grpc.aio.Server,
+    route: str,
+    *,
+    handler_factory: Callable[[], SessionHandler],
+    input_model: Any = None,
+) -> None:
+    """
+    Register one bidirectional-streaming route's `SessionHandler` on
+    *server*, callable by a client that sends `route` in its
+    `x-openframe-route` metadata on a `CallStream` call — the streaming
+    counterpart to `bind_service`.
+
+    `on_open` runs — and can reject — before this method's first `yield`,
+    mirroring `bind_service`'s own `_abort_for_exception` path exactly
+    (a reject here is just as uncommitted as a unary `Call` failure,
+    confirmed by spiking `context.abort()` before any `yield`). `on_event`
+    is dispatched from a separate task than the one `yield`ing responses,
+    since inbound (`request_iterator`) and outbound (this method's own
+    `yield` loop) are driven independently by `grpc.aio` — see this
+    module's own docstring for the real race that forced this shape
+    rather than reusing `openframe.protocol.base.session.run_opened_session`
+    wholesale.
+
+    Args:
+        server:          The `grpc.aio.Server` to register onto.
+        route:           Logical route name — independent of `bind_service`'s
+                         own route namespace (see `_RouteRegisteringServicer`'s
+                         own docstring).
+        handler_factory: Builds a fresh `SessionHandler` instance for this
+                         call. Called once per call, no caching.
+        input_model:     Same as `bind_service`'s own `input_model` — casts
+                         each decoded inbound event before `on_event` sees
+                         it. `None` passes the decoded value through
+                         unchanged.
+    """
+    servicer = _get_or_create_servicer(server)
+    adapter = TypeAdapter(input_model) if input_model is not None else None
+
+    async def _handle_stream(
+        request_iterator: AsyncIterator["generic_pb2.GenericRequest"], context: grpc.aio.ServicerContext
+    ) -> AsyncIterator["generic_pb2.GenericResponse"]:
+        metadata = dict(context.invocation_metadata())
+        session = GrpcSession(context=build_request_context(metadata))
+        handler = handler_factory()
+
+        try:
+            await open_session(handler, session)
+        except Exception as exc:
+            await _abort_for_exception(context, exc, session.context.correlation_id)
+            return  # unreachable: _abort_for_exception always raises
+
+        async def inbound_events():
+            async for request in request_iterator:
+                raw = json.loads(request.json_payload) if request.json_payload else None
+                yield adapter.validate_python(raw) if adapter is not None and raw is not None else raw
+
+        async def _dispatch() -> None:
+            """
+            Consumes inbound events, dispatching to `on_event`. Does NOT
+            call `on_close` — only the outer loop below does, since it's
+            the one thing `grpc.aio` reliably cancels on a real disconnect
+            (confirmed by spiking; `request_iterator` ending on its own is
+            a separate, independently-scheduled signal that can race it).
+            Calls `session.close()` itself at its own natural end points
+            so the outer loop's sentinel-wait unblocks either way.
+            """
+            try:
+                async for event in inbound_events():
+                    await handler.on_event(session, event)
+                # request_iterator ending (confirmed by spiking, not
+                # assumed) is NOT on its own proof the client finished
+                # gracefully — grpc.aio resolves it via plain
+                # StopAsyncIteration *deterministically faster* than it
+                # delivers context.cancelled() for the exact same
+                # disconnect, confirmed consistent across multiple real
+                # spikes, not a one-off race. A short poll (confirmed
+                # needed: a single asyncio.sleep(0) tick was NOT enough —
+                # context.cancelled() only flips after the underlying
+                # HTTP/2 GOAWAY frame is fully processed, visibly a few ms
+                # later in practice) gives that slower signal a real
+                # chance to land before trusting "ended normally" as
+                # actually meaning COMPLETED rather than CLIENT_DISCONNECT.
+                for _ in range(20):
+                    if context.cancelled():
+                        break
+                    await asyncio.sleep(0.005)
+                if context.cancelled():
+                    await session.close(CloseReason.CLIENT_DISCONNECT)
+                else:
+                    await session.close(CloseReason.COMPLETED)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await send_error_event(session, exc)
+                await session.close(CloseReason.ERROR)
+
+        dispatch_task = asyncio.create_task(_dispatch())
+        try:
+            while True:
+                item = await session._queue.get()
+                if item is _STREAM_SENTINEL:
+                    break
+                yield generic_pb2.GenericResponse(json_payload=json.dumps(_to_jsonable(item)))
+        except asyncio.CancelledError:
+            # The one place this binder learns about a real disconnect,
+            # confirmed reliable by spiking. A no-op if the session was
+            # already closed for some other reason (session.close() is
+            # idempotent) — first signal wins.
+            await session.close(CloseReason.CLIENT_DISCONNECT)
+            raise
+        finally:
+            if not dispatch_task.done():
+                dispatch_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await dispatch_task
+            # session.close_reason, not a locally-tracked variable — the
+            # same pattern already proven for SSE's own bind_session, for
+            # the same reason: whoever actually closed the session first
+            # (the handler itself, a dispatch error, or this disconnect
+            # branch) decided the real reason, not whichever code path
+            # happens to be reading it back out.
+            await handler.on_close(session, session.close_reason or CloseReason.COMPLETED)
+
+    servicer.register_stream(route, _handle_stream)
 
 
 async def _abort_for_exception(

@@ -3,7 +3,7 @@
 import grpc
 import warnings
 
-from openframe.protocol.grpc import generic_pb2 as generic__pb2
+from openframe.protocol.grpc import generic_pb2 as openframe_dot_protocol_dot_grpc_dot_generic__pb2
 
 GRPC_GENERATED_VERSION = '1.84.0'
 GRPC_VERSION = grpc.__version__
@@ -18,7 +18,7 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + ' but the generated code in generic_pb2_grpc.py depends on'
+        + ' but the generated code in openframe/protocol/grpc/generic_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
@@ -36,8 +36,13 @@ class GenericServiceStub:
         """
         self.Call = channel.unary_unary(
                 '/openframe.protocol.grpc.GenericService/Call',
-                request_serializer=generic__pb2.GenericRequest.SerializeToString,
-                response_deserializer=generic__pb2.GenericResponse.FromString,
+                request_serializer=openframe_dot_protocol_dot_grpc_dot_generic__pb2.GenericRequest.SerializeToString,
+                response_deserializer=openframe_dot_protocol_dot_grpc_dot_generic__pb2.GenericResponse.FromString,
+                _registered_method=True)
+        self.CallStream = channel.stream_stream(
+                '/openframe.protocol.grpc.GenericService/CallStream',
+                request_serializer=openframe_dot_protocol_dot_grpc_dot_generic__pb2.GenericRequest.SerializeToString,
+                response_deserializer=openframe_dot_protocol_dot_grpc_dot_generic__pb2.GenericResponse.FromString,
                 _registered_method=True)
 
 
@@ -50,13 +55,27 @@ class GenericServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def CallStream(self, request_iterator, context):
+        """Bidirectional streaming counterpart to Call, same route-multiplexing
+        trick (x-openframe-route metadata) — the SessionHandler (ADR-008)
+        binding, not a per-route message type.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_GenericServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
             'Call': grpc.unary_unary_rpc_method_handler(
                     servicer.Call,
-                    request_deserializer=generic__pb2.GenericRequest.FromString,
-                    response_serializer=generic__pb2.GenericResponse.SerializeToString,
+                    request_deserializer=openframe_dot_protocol_dot_grpc_dot_generic__pb2.GenericRequest.FromString,
+                    response_serializer=openframe_dot_protocol_dot_grpc_dot_generic__pb2.GenericResponse.SerializeToString,
+            ),
+            'CallStream': grpc.stream_stream_rpc_method_handler(
+                    servicer.CallStream,
+                    request_deserializer=openframe_dot_protocol_dot_grpc_dot_generic__pb2.GenericRequest.FromString,
+                    response_serializer=openframe_dot_protocol_dot_grpc_dot_generic__pb2.GenericResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -84,8 +103,35 @@ class GenericService:
             request,
             target,
             '/openframe.protocol.grpc.GenericService/Call',
-            generic__pb2.GenericRequest.SerializeToString,
-            generic__pb2.GenericResponse.FromString,
+            openframe_dot_protocol_dot_grpc_dot_generic__pb2.GenericRequest.SerializeToString,
+            openframe_dot_protocol_dot_grpc_dot_generic__pb2.GenericResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def CallStream(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_stream(
+            request_iterator,
+            target,
+            '/openframe.protocol.grpc.GenericService/CallStream',
+            openframe_dot_protocol_dot_grpc_dot_generic__pb2.GenericRequest.SerializeToString,
+            openframe_dot_protocol_dot_grpc_dot_generic__pb2.GenericResponse.FromString,
             options,
             channel_credentials,
             insecure,

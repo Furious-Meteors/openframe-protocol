@@ -39,10 +39,18 @@ from openframe.protocol.grpc import generic_pb2, generic_pb2_grpc
 
 if TYPE_CHECKING:
     from openframe.protocol.grpc.client import GrpcRemoteCommandClient, GrpcRemoteQueryClient
-    from openframe.protocol.grpc.server import ROUTE_METADATA_KEY, bind_service, create_server
+    from openframe.protocol.grpc.server import (
+        ROUTE_METADATA_KEY,
+        GrpcSession,
+        bind_service,
+        bind_service_stream,
+        create_server,
+    )
 
 __all__ = [
     "bind_service",
+    "bind_service_stream",
+    "GrpcSession",
     "ROUTE_METADATA_KEY",
     "create_server",
     "GrpcRemoteQueryClient",
@@ -51,7 +59,7 @@ __all__ = [
     "generic_pb2_grpc",
 ]
 
-_FROM_SERVER = {"bind_service", "ROUTE_METADATA_KEY", "create_server"}
+_FROM_SERVER = {"bind_service", "bind_service_stream", "GrpcSession", "ROUTE_METADATA_KEY", "create_server"}
 _FROM_CLIENT = {"GrpcRemoteQueryClient", "GrpcRemoteCommandClient"}
 
 

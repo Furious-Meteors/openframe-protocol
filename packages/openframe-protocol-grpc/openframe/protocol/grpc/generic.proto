@@ -15,4 +15,8 @@ message GenericResponse {
 
 service GenericService {
   rpc Call(GenericRequest) returns (GenericResponse);
+  // Bidirectional streaming counterpart to Call, same route-multiplexing
+  // trick (x-openframe-route metadata) — the SessionHandler (ADR-008)
+  // binding, not a per-route message type.
+  rpc CallStream(stream GenericRequest) returns (stream GenericResponse);
 }
