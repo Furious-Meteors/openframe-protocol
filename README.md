@@ -1,4 +1,8 @@
 <p align="center">
+  <img src="https://raw.githubusercontent.com/Furious-Meteors/openframe-protocol/production/docs/assets/images/banner.png" alt="openframe-core" width="100%" />
+</p>
+
+<p align="center">
   <a href="https://pypi.org/project/openframe-protocol/"><img src="https://img.shields.io/pypi/v/openframe-protocol?color=6DB33F&labelColor=1a1a1a&label=PyPI" alt="PyPI version"/></a>
   </a>
   <a href="https://pypi.org/project/openframe-core/"><img src="https://img.shields.io/pypi/pyversions/openframe-core?color=6DB33F&labelColor=1a1a1a" alt="Python versions"/></a>
@@ -16,8 +20,9 @@
 ---
 
 `openframe-protocol` is the communication-protocol family of the OpenFrame Microservice
-Development Suite — HTTP, gRPC, SSE, WebSocket, and webhooks today, with MCP and the rest of the
-roadmap gated on demonstrated need (see `openframe-protocol-design.md` section 0). Every
+Development Suite — HTTP (including HTTP/3 over QUIC), gRPC, SSE, WebSocket, and webhooks today,
+with MCP and the rest of the roadmap gated on demonstrated need (see `openframe-protocol-design.md`
+section 0). Every
 request/response binding package follows the same two-file schema: `server.py` (bind a
 `UseCase`/`CommandHandler`/`QueryHandler` from `openframe.core.inbound` to an inbound route) and
 `client.py` (call another service built on this platform) — split by `[server]`/`[client]` extras
@@ -33,8 +38,10 @@ below.
 
 Not yet published to PyPI — install from this repo directly (editable installs of the sibling
 packages, or build local wheels) until a first release ships. `openframe-protocol-base` is at
-**0.4.0**, `openframe-protocol-http` at **0.8.0**, `openframe-protocol-grpc` at **0.4.0**. All
-three develop and test against `openframe-core>=3.2.1,<4` (`openframe-core` itself is at **3.8.0**).
+**0.4.2**, `openframe-protocol-http` at **0.11.0**, `openframe-protocol-grpc` at **0.4.2**,
+`openframe-protocol-media` at **0.2.0**. All four develop and test against
+`openframe-core>=3.2.1,<4` (`openframe-core` itself is at **3.9.0** — `openframe-protocol-media`
+specifically needs `>=3.9.0` for `openframe.core.media.MediaFrame`/`MediaKind`).
 
 Both transports can run **concurrently in one process, over the same business logic** — a real
 service in `openframe-local-validation-framework` serves HTTP and gRPC side by side, sharing the
@@ -57,6 +64,7 @@ lifespan/middleware block every consuming service used to hand-write itself. See
 ```bash
 pip install "openframe-protocol[http]"   # server.py needs [server] extra too, or [client]
 pip install "openframe-protocol[grpc]"
+pip install "openframe-protocol[media]"  # RTMP ingest.py needs [ingest] (pyrtmp); HLS/DASH delivery.py needs [delivery] (fastapi)
 ```
 
 Each transport package splits its own runtime dependency further by direction:
@@ -80,9 +88,10 @@ pip install "openframe-protocol[all]"     # every transport package, base includ
 
 | Extra | Package | Status | Depends on |
 |---|---|---|---|
-| (default) | `openframe-protocol-base` | **0.4.0** — error mapping, `RequestContext` construction, request/response + session conformance suites, `open_session`/`run_opened_session`/`send_error_event` | `openframe-core` |
-| `[http]` | `openframe-protocol-http` | **0.8.0** — `bind_query`/`bind_command`/`create_app`/`bind_session`/`bind_websocket`/`bind_webhook` (`[server]`), `HttpRemoteQueryClient`/`HttpRemoteCommandClient` (`[client]`) | `openframe-protocol-base` |
-| `[grpc]` | `openframe-protocol-grpc` | **0.4.0** — `bind_service`/`bind_service_stream`/`create_server` (`[server]`), `GrpcRemoteQueryClient`/`GrpcRemoteCommandClient` (`[client]`) | `openframe-protocol-base` |
+| (default) | `openframe-protocol-base` | **0.4.2** — error mapping, `RequestContext` construction, request/response + session conformance suites, `open_session`/`run_opened_session`/`send_error_event` | `openframe-core` |
+| `[http]` | `openframe-protocol-http` | **0.11.0** — `bind_query`/`bind_command`/`create_app`/`bind_session`/`bind_websocket`/`bind_webhook` (`[server]`), `create_quic_config` (`[quic]`, HTTP/3 over QUIC — no `bind_quic`, every binder works unchanged), `HttpRemoteQueryClient`/`HttpRemoteCommandClient` (`[client]`) | `openframe-protocol-base` |
+| `[grpc]` | `openframe-protocol-grpc` | **0.4.2** — `bind_service`/`bind_service_stream`/`create_server` (`[server]`), `GrpcRemoteQueryClient`/`GrpcRemoteCommandClient` (`[client]`) | `openframe-protocol-base` |
+| `[media]` | `openframe-protocol-media` | **0.2.0** — `bind_ingest`/`create_server`/`RtmpRegistry`/`RtmpSession` (`[ingest]`, RTMP over `pyrtmp`), `bind_hls_delivery`/`bind_dash_delivery`/`bind_media_delivery` (`[delivery]`, HLS/DASH over fastapi, with Range support), `MediaFlowController`/`DropPolicy`/`FlowConfig`/`MediaRequest`/`MediaObject`/`parse_range_header` (no extra — zero third-party deps) | `openframe-protocol-base`, `openframe-core>=3.9.0` |
 
 `TransportConformanceTests` and `RemoteClientConformanceTests` (`openframe-protocol-base`) both
 pass for real against **two** transports — the rule-of-three bar the project's own design spec
@@ -283,6 +292,7 @@ import asyncio
 from contextlib import AsyncExitStack
 
 import uvicorn
+from openframe.core.telemetry import setup_telemetry, shutdown_telemetry
 from openframe.protocol.grpc import create_server
 from openframe.protocol.http import create_app
 
@@ -299,6 +309,14 @@ async def _noop() -> None:
 async def main() -> None:
     settings = EntrypointSettings()
 
+    # Telemetry set up/torn down exactly ONCE here, shared by whichever
+    # transports are enabled — create_app/create_server are both told
+    # manage_telemetry=False below. Without that, each one calls
+    # setup_telemetry()/shutdown_telemetry() independently, and whichever
+    # transport's own lifespan exits first tears down the providers the
+    # other is still using.
+    setup_telemetry()
+
     # Startup/shutdown called exactly ONCE here, shared by whichever
     # transports are enabled — create_app/create_server each get a no-op
     # hook instead. Calling pipeline.initialise()/shutdown() per transport
@@ -310,14 +328,17 @@ async def main() -> None:
             tasks: dict[str, asyncio.Task] = {}
 
             if settings.enable_http:
-                app = create_app(title="items-service", on_startup=_noop, on_shutdown=_noop, routers=[http_router])
+                app = create_app(
+                    title="items-service", on_startup=_noop, on_shutdown=_noop,
+                    routers=[http_router], manage_telemetry=False,
+                )
                 http_server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=settings.http_port))
                 tasks["http"] = asyncio.create_task(http_server.serve())
 
             if settings.enable_grpc:
                 grpc_server = await stack.enter_async_context(
                     create_server(address=settings.grpc_address, configure=configure_grpc,
-                                  on_startup=_noop, on_shutdown=_noop)
+                                  on_startup=_noop, on_shutdown=_noop, manage_telemetry=False)
                 )
                 tasks["grpc"] = asyncio.create_task(grpc_server.wait_for_termination())
 
@@ -332,6 +353,7 @@ async def main() -> None:
                 await tasks["http"]
     finally:
         await pipeline.shutdown()
+        shutdown_telemetry()
 
 
 if __name__ == "__main__":
@@ -475,13 +497,48 @@ normal path unchanged — proven with a real `AdapterConnectionError` → 503.
 
 ---
 
+## HTTP/3 over QUIC
+
+QUIC is a transport-layer change, not an application-layer one — every existing `-http` binder
+(`bind_query`, `bind_command`, `bind_session`, `bind_websocket`, `bind_webhook`) already runs
+unmodified over it. Confirmed by a real spike, not assumed: a real Hypercorn server running
+`create_app()`'s completely unmodified output, driven by a real `aioquic`-based HTTP/3 client, round
+trips a `bind_query` route with status 200, the correct JSON body, and `build_request_context`'s
+correlation-id generation all intact. Because of that, there is **no `bind_quic`** — QUIC only needs
+a different ASGI server (Hypercorn, which speaks HTTP/3) in place of uvicorn, configured via one
+function:
+
+```python
+from openframe.protocol.http import create_app
+from openframe.protocol.http.quic import create_quic_config
+from hypercorn.asyncio import serve
+
+app = create_app(title="items-service", on_startup=pipeline.initialise, on_shutdown=pipeline.shutdown, routers=[router])
+
+config = create_quic_config(
+    bind="0.0.0.0:443",
+    certfile="/etc/tls/fullchain.pem",
+    keyfile="/etc/tls/privkey.pem",
+)
+
+await serve(app, config)
+```
+
+`create_quic_config` just builds a `hypercorn.Config` with `alpn_protocols=("h3",)` and both `bind`
+and `quic_bind` set to the same address (QUIC runs over UDP, uvicorn's TCP accept loop never comes
+into it). This lives as a module in `-http` behind a `[quic]` extra (`hypercorn[h3]`), not a separate
+package — same reasoning as SSE/WebSocket/webhooks: no new wire schema, no new binder, just another
+optional server dependency.
+
+---
+
 ## Ecosystem
 
 | Package | Install | Description |
 |---|---|---|
 | [`openframe-core`](https://github.com/Furious-Meteors/openframe-core) | `pip install openframe-core` | Ports · tracing · telemetry · exceptions · config |
 | [`openframe-adapters`](https://github.com/Furious-Meteors/openframe-adapters) | `pip install openframe-adapters[postgres]` | Database and queue adapters — Postgres, Mongo, Redis, Kafka, and more |
-| `openframe-protocol` | `pip install "openframe-protocol[http]"` | HTTP · gRPC · SSE · WebSocket · webhooks today — MCP, media protocols on demonstrated need |
+| `openframe-protocol` | `pip install "openframe-protocol[http]"` | HTTP (incl. HTTP/3 over QUIC) · gRPC · SSE · WebSocket · webhooks · RTMP ingest today — MCP, HLS/DASH delivery on demonstrated need |
 | `openframe-infra` | — | Storage · auth · secrets · observability · feature flags (not yet built) |
 | `openframe-ai` | — | LangChain · LlamaIndex · CrewAI · model serving · training (not yet built) |
 
