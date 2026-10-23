@@ -19,13 +19,12 @@ from __future__ import annotations
 
 import grpc
 import pytest
-from pydantic import BaseModel
-
 from openframe.core.exceptions import AdapterConnectionError, AdapterTimeoutError
 from openframe.core.testing import EchoUseCase, SpyQueryHandler
-from openframe.core.testing.fixtures import *  # noqa: F401,F403
+from openframe.core.testing.fixtures import *
 from openframe.protocol.base.testing import UNEXPECTED_ERROR_SECRET
 from openframe.protocol.grpc import bind_service
+from pydantic import BaseModel
 
 
 class _Query(BaseModel):

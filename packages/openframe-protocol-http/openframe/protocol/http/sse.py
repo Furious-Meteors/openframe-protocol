@@ -35,13 +35,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
-
 from openframe.core.inbound import CloseReason, RequestContext, SessionHandler
-from openframe.protocol.base.context import build_request_context
+from openframe.protocol.base.context import ContextEnricher, build_request_context
 from openframe.protocol.base.session import open_session
 
 __all__ = ["SseSession", "bind_session"]
@@ -62,9 +62,13 @@ class SseSession:
     one.
     """
 
-    def __init__(self, *, context: RequestContext) -> None:
+    def __init__(self, *, context: RequestContext, queue_maxsize: int = 1000) -> None:
         self.context = context
-        self._queue: asyncio.Queue[Any] = asyncio.Queue()
+        # Bounded — an unbounded queue lets a slow/stalled client's own
+        # backpressure turn into unbounded server memory growth if the
+        # handler keeps producing faster than the client reads. send()
+        # blocks once full, applying backpressure to the producer instead.
+        self._queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=queue_maxsize)
         self._closed = False
         self.close_reason: CloseReason | None = None
 
@@ -94,6 +98,8 @@ def bind_session(
     path: str,
     *,
     handler_factory: Callable[[], SessionHandler],
+    context_enricher: ContextEnricher | None = None,
+    queue_maxsize: int = 1000,
 ) -> None:
     """
     Register a GET route at *path* opening an SSE stream backed by a
@@ -107,11 +113,17 @@ def bind_session(
     stream that already sent a 200 before failing. See
     `openframe.protocol.base.session.open_session`'s own docstring for
     the full reasoning.
+
+    `context_enricher`: see `build_request_context`'s own docstring — the
+    hook a service uses to set `principal`/`tenant` on the session's
+    `RequestContext`, same as `bind_query`/`bind_command` accept it.
+    `queue_maxsize`: bounds `SseSession`'s internal queue — see its own
+    docstring for why an unbounded one is a real memory-growth risk.
     """
 
     async def endpoint(request: Request) -> StreamingResponse:
-        context = build_request_context(dict(request.headers))
-        session = SseSession(context=context)
+        context = build_request_context(dict(request.headers), context_enricher=context_enricher)
+        session = SseSession(context=context, queue_maxsize=queue_maxsize)
         handler = handler_factory()
 
         # Accept/reject before anything is committed to the wire.
@@ -135,6 +147,12 @@ def bind_session(
         # for the whole response, set once, not per-event: a session has
         # exactly one RequestContext for its entire lifetime.
         response.headers["X-Correlation-ID"] = context.correlation_id
+        # Without these, an intermediary proxy (nginx's default buffering,
+        # or any shared/browser cache) can hold the whole response instead
+        # of streaming it line by line, or cache a stream that was never
+        # meant to be cached.
+        response.headers["Cache-Control"] = "no-cache"
+        response.headers["X-Accel-Buffering"] = "no"
         return response
 
     router.add_api_route(path, endpoint, methods=["GET"])

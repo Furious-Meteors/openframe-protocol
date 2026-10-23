@@ -8,11 +8,14 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-
 from openframe.core.exceptions import AdapterConnectionError
 from openframe.core.inbound import CloseReason, RequestContext
 from openframe.core.testing import InMemorySession
-from openframe.protocol.base.session import open_session, run_opened_session, run_session
+from openframe.protocol.base.session import (
+    open_session,
+    run_opened_session,
+    run_session,
+)
 
 
 async def _empty_events():

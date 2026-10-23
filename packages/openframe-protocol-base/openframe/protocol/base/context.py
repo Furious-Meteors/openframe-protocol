@@ -18,13 +18,12 @@ Dependency order:
 from __future__ import annotations
 
 import uuid
-from typing import Callable, Mapping
-
-from opentelemetry import propagate, trace
+from collections.abc import Callable, Mapping
 
 from openframe.core.inbound import RequestContext
+from opentelemetry import propagate, trace
 
-__all__ = ["build_request_context"]
+__all__ = ["ContextEnricher", "build_request_context"]
 
 ContextEnricher = Callable[[RequestContext], RequestContext]
 
@@ -79,12 +78,30 @@ def build_request_context(
     if span_context.is_valid:
         correlation_id = f"{span_context.trace_id:032x}"
     else:
-        correlation_id = _get_header(headers, correlation_header) or str(uuid.uuid4())
+        candidate = _get_header(headers, correlation_header)
+        safe_candidate = candidate if candidate is not None and _is_safe_correlation_id(candidate) else None
+        correlation_id = safe_candidate or str(uuid.uuid4())
 
     context = RequestContext(correlation_id=correlation_id)
     if context_enricher is not None:
         context = context_enricher(context)
     return context
+
+
+_MAX_CORRELATION_ID_LENGTH = 128
+
+
+def _is_safe_correlation_id(value: str) -> bool:
+    """
+    A client-supplied correlation id is reflected straight back into a
+    response header and into every log line/span for the request — an
+    overly long value is a cheap log-flooding vector, and a value
+    containing control characters (CR/LF in particular) risks header
+    injection if some caller downstream builds a raw header line from it
+    without its own escaping. Neither is trusted: a value failing either
+    check falls back to a fresh uuid4 instead of being used as-is.
+    """
+    return 0 < len(value) <= _MAX_CORRELATION_ID_LENGTH and value.isprintable() and "\n" not in value and "\r" not in value
 
 
 def _get_header(headers: Mapping[str, str], name: str) -> str | None:

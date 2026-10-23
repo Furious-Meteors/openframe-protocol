@@ -10,9 +10,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter, FastAPI
 from httpx import ASGITransport, AsyncClient
-from pydantic import BaseModel
-
 from openframe.protocol.http import bind_command, install_error_handlers
+from pydantic import BaseModel
 
 
 class _StatusQuery(BaseModel):
@@ -25,7 +24,6 @@ async def test_bind_command_with_path_param_and_query_model_and_no_body() -> Non
     class _RecordingHandler:
         async def execute(self, value, context=None):
             received["value"] = value
-            return None
 
     app = FastAPI()
     install_error_handlers(app)

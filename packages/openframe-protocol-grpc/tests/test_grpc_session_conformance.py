@@ -10,10 +10,8 @@ import json
 
 import grpc
 import pytest
-
 from openframe.core.exceptions import AdapterTimeoutError
 from openframe.core.inbound import CloseReason
-from openframe.protocol.base.errors import categorize
 from openframe.protocol.base.session_testing import (
     SessionConformanceTests,
     SessionDriver,
@@ -170,7 +168,10 @@ class _GrpcSessionDriver:
         try:
             channel = grpc.aio.insecure_channel(f"127.0.0.1:{port}")
             stub = generic_pb2_grpc.GenericServiceStub(channel)
-            call = stub.CallStream(
+            # Held, not awaited directly — see test_bind_service_stream.py's
+            # own identical comment: grpc.aio's call object owns the RPC's
+            # lifetime, so dropping the reference would cancel it early.
+            call = stub.CallStream(  # noqa: F841
                 _req_gen(hold_open=True), metadata=(("x-openframe-route", "echo"),)
             )
             await asyncio.sleep(0.2)

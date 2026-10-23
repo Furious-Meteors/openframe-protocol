@@ -11,10 +11,8 @@ import asyncio
 import pytest
 from fastapi import APIRouter, FastAPI
 from httpx import ASGITransport, AsyncClient
-
 from openframe.core.exceptions import AdapterTimeoutError
 from openframe.protocol.base.errors import categorize
-from openframe.protocol.base.session import send_error_event
 from openframe.protocol.base.session_testing import (
     SessionConformanceTests,
     SessionDriver,

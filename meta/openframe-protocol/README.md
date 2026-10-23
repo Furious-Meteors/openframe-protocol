@@ -12,9 +12,9 @@ pip install "openframe-protocol[http]"
 
 | Package | Extra | Status |
 |---|---|---|
-| `openframe-protocol-base` | (default) | 0.1.0 |
-| `openframe-protocol-http` | `[http]` | 0.1.0 — M1 of the project's own build plan |
+| `openframe-protocol-base` | (default) | 0.4.2 |
+| `openframe-protocol-http` | `[http]` | 0.11.0 — `bind_query`/`bind_command`, SSE/WebSocket sessions, webhooks, HTTP/3 over QUIC |
+| `openframe-protocol-grpc` | `[grpc]` | 0.4.2 — `bind_service` + `bind_service_stream` (gRPC streaming sessions) |
 
 See the repo's `PLAN.md` and the design spec for what's built vs. still
-only named (gRPC, MCP, sessions, media protocols — all out of scope for
-this first release).
+only named (MCP, A2A, SMTP/FTP, media protocols — on demonstrated need).

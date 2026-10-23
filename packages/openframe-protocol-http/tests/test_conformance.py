@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-
 from openframe.protocol.base.errors import ErrorCategory
 from openframe.protocol.base.testing import DriverResult, TransportConformanceTests
 

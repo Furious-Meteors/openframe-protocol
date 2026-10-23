@@ -17,11 +17,10 @@ import json
 import pytest
 from fastapi import APIRouter, FastAPI
 from fastapi.testclient import TestClient
-from starlette.websockets import WebSocketDisconnect
-
 from openframe.core.exceptions import AdapterTimeoutError
 from openframe.core.inbound import CloseReason
 from openframe.protocol.http import bind_websocket, install_error_handlers
+from starlette.websockets import WebSocketDisconnect
 
 
 def _build_app(handler_factory):
@@ -94,18 +93,16 @@ def test_bidirectional_exchange_calls_on_event_in_order() -> None:
 def test_on_open_reject_produces_a_real_failed_handshake() -> None:
     app = _build_app(lambda: _RejectingHandler())
     client = TestClient(app)
-    with pytest.raises(WebSocketDisconnect):
-        with client.websocket_connect("/ws"):
-            pass
+    with pytest.raises(WebSocketDisconnect), client.websocket_connect("/ws"):
+        pass
 
 
 def test_on_open_reject_still_calls_on_close() -> None:
     handler = _RejectingHandler()
     app = _build_app(lambda: handler)
     client = TestClient(app)
-    with pytest.raises(WebSocketDisconnect):
-        with client.websocket_connect("/ws"):
-            pass
+    with pytest.raises(WebSocketDisconnect), client.websocket_connect("/ws"):
+        pass
     assert handler.closed_with is CloseReason.ERROR
 
 

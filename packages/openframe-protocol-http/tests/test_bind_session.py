@@ -13,10 +13,8 @@ from __future__ import annotations
 import asyncio
 import json
 
-import pytest
 from fastapi import APIRouter, FastAPI
 from httpx import ASGITransport, AsyncClient
-
 from openframe.core.exceptions import AdapterTimeoutError
 from openframe.core.inbound import CloseReason
 from openframe.protocol.base.session import send_error_event

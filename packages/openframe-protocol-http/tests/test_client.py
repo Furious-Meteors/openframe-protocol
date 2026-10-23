@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-
 from openframe.core.exceptions import (
     AdapterConnectionError,
     AdapterNotFoundError,
@@ -27,7 +26,11 @@ from openframe.core.exceptions import (
     AdapterTimeoutError,
 )
 from openframe.protocol.base.testing import RemoteClientConformanceTests
-from openframe.protocol.http import HttpRemoteCommandClient, HttpRemoteQueryClient, RequestSpec
+from openframe.protocol.http import (
+    HttpRemoteCommandClient,
+    HttpRemoteQueryClient,
+    RequestSpec,
+)
 
 
 @pytest.fixture
@@ -108,7 +111,6 @@ async def test_query_client_path_param_substitution() -> None:
     rather than the toy app, since that's the real shape this exists for.
     """
     from fastapi import APIRouter, FastAPI
-
     from openframe.core.testing import SpyQueryHandler
     from openframe.protocol.http import bind_query, install_error_handlers
 

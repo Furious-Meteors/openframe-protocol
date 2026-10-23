@@ -9,10 +9,15 @@ from __future__ import annotations
 
 import grpc
 import pytest
-
 from openframe.core.exceptions import AdapterConnectionError
 from openframe.core.testing import SpyQueryHandler
-from openframe.protocol.grpc import ROUTE_METADATA_KEY, bind_service, create_server, generic_pb2, generic_pb2_grpc
+from openframe.protocol.grpc import (
+    ROUTE_METADATA_KEY,
+    bind_service,
+    create_server,
+    generic_pb2,
+    generic_pb2_grpc,
+)
 
 
 async def test_configure_runs_before_start_and_routes_are_callable() -> None:

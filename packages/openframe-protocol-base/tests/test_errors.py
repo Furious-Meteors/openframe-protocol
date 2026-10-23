@@ -12,8 +12,6 @@ correct, not a surprising, outcome for an unrecognised code).
 from __future__ import annotations
 
 import pytest
-from pydantic import BaseModel, ValidationError
-
 from openframe.core.exceptions import (
     AdapterConfigurationError,
     AdapterConnectionError,
@@ -36,7 +34,7 @@ from openframe.protocol.base.errors import (
     categorize,
     raise_for_envelope,
 )
-
+from pydantic import BaseModel, ValidationError
 
 # ---------------------------------------------------------------------------
 # categorize() — one test per real adapter exception class
@@ -111,9 +109,7 @@ def _all_adapter_and_plugin_exception_instances() -> list[BaseException]:
     instances: list[BaseException] = []
     for name in adapter_mod.__all__:
         obj = getattr(adapter_mod, name)
-        if isinstance(obj, type) and issubclass(obj, AdapterError) and obj is not AdapterError:
-            instances.append(obj("msg", adapter="x", operation="op"))
-        elif obj is AdapterError:
+        if isinstance(obj, type) and issubclass(obj, AdapterError) and obj is not AdapterError or obj is AdapterError:
             instances.append(obj("msg", adapter="x", operation="op"))
 
     for name in plugin_mod.__all__:

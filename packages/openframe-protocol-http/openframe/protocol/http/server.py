@@ -39,21 +39,35 @@ from __future__ import annotations
 
 import inspect
 import logging
+from collections.abc import Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
-from typing import Any, Awaitable, Callable, Sequence
+from typing import Any
 
-from fastapi import APIRouter, Body, FastAPI, HTTPException, Path, Query, Request, Response
+from fastapi import (
+    APIRouter,
+    Body,
+    FastAPI,
+    HTTPException,
+    Path,
+    Query,
+    Request,
+    Response,
+)
 from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel, ValidationError
-
 from openframe.core.exceptions import AdapterConnectionError
 from openframe.core.inbound import RequestContext
 from openframe.core.middleware import TelemetryMiddleware
-from openframe.core.telemetry import record_error, record_lifecycle_event, setup_telemetry, shutdown_telemetry
-from openframe.protocol.base.context import build_request_context
+from openframe.core.telemetry import (
+    record_error,
+    record_lifecycle_event,
+    setup_telemetry,
+    shutdown_telemetry,
+)
+from openframe.protocol.base.context import ContextEnricher, build_request_context
 from openframe.protocol.base.errors import ErrorCategory, build_envelope, categorize
+from pydantic import BaseModel, ValidationError
 
-__all__ = ["bind_query", "bind_command", "install_error_handlers", "create_app"]
+__all__ = ["bind_command", "bind_query", "create_app", "install_error_handlers"]
 
 _logger = logging.getLogger(__name__)
 
@@ -64,6 +78,18 @@ _CATEGORY_TO_STATUS: dict[ErrorCategory, int] = {
     ErrorCategory.UNAVAILABLE: 503,
     ErrorCategory.INTERNAL: 500,
 }
+_STATUS_TO_CATEGORY: dict[int, ErrorCategory] = {status: category for category, status in _CATEGORY_TO_STATUS.items()}
+# Extends the reverse lookup for a status this binder itself can raise as a
+# plain `HTTPException` (not via an `AdapterError`) but that still has a
+# real match among the five categories — 400 (bad webhook timestamp, bad
+# query) and 413 (bind_webhook's own max_body_size) are both "the request
+# itself was malformed", the same bucket 422 already occupies. A status
+# with no real match (401, 403, 409 — none of the five categories draw an
+# auth/conflict distinction, see webhook.py's own docstring for why that's
+# deliberate, not an oversight) is left out on purpose, falling back to the
+# generic `HTTP_<status>` code below rather than being forced into a
+# category that would misrepresent it.
+_STATUS_TO_CATEGORY.update({400: ErrorCategory.INVALID, 413: ErrorCategory.INVALID})
 
 
 def _build_signature(
@@ -150,6 +176,7 @@ def _bind(
     status_code: int,
     not_found_when: Callable[[Any], bool] | None,
     not_found_detail: Callable[[Any], str] | None,
+    context_enricher: ContextEnricher | None = None,
 ) -> None:
     from fastapi import Depends
 
@@ -158,7 +185,7 @@ def _bind(
         response: Response = kwargs["response"]
         handler = kwargs["__handler__"]
         handler_input = _resolve_input(build_input, kwargs)
-        context: RequestContext = build_request_context(dict(request.headers))
+        context: RequestContext = build_request_context(dict(request.headers), context_enricher=context_enricher)
         response.headers["X-Correlation-ID"] = context.correlation_id
         result = await handler.execute(handler_input, context)
         if not_found_when is not None and not_found_when(result):
@@ -201,6 +228,7 @@ def bind_query(
     status_code: int = 200,
     not_found_when: Callable[[Any], bool] | None = None,
     not_found_detail: Callable[[Any], str] | None = None,
+    context_enricher: ContextEnricher | None = None,
 ) -> None:
     """
     Register a GET route backed by a `QueryHandler`/`UseCase`.
@@ -233,6 +261,10 @@ def bind_query(
                         migrated from a hand-written route that did
                         exactly this); defaults to the generic `"not
                         found"` previous routes used when omitted.
+        context_enricher: Passed straight through to `build_request_context`
+                        — the hook a service uses to set `principal`/
+                        `tenant` on every request's `RequestContext`,
+                        without editing this binder itself.
     """
     _bind(
         router,
@@ -247,6 +279,7 @@ def bind_query(
         status_code=status_code,
         not_found_when=not_found_when,
         not_found_detail=not_found_detail,
+        context_enricher=context_enricher,
     )
 
 
@@ -264,6 +297,7 @@ def bind_command(
     status_code: int = 200,
     not_found_when: Callable[[Any], bool] | None = None,
     not_found_detail: Callable[[Any], str] | None = None,
+    context_enricher: ContextEnricher | None = None,
 ) -> None:
     """
     Register a POST/PUT/PATCH/DELETE route backed by a `UseCase`/`CommandHandler`.
@@ -297,6 +331,7 @@ def bind_command(
         status_code=status_code,
         not_found_when=not_found_when,
         not_found_detail=not_found_detail,
+        context_enricher=context_enricher,
     )
 
 
@@ -314,12 +349,8 @@ def install_error_handlers(app: Any) -> None:
     this call here an INTERNAL error would be correctly hidden from the
     caller but silently never recorded anywhere.
     """
-    from fastapi import FastAPI
     from fastapi.responses import JSONResponse
-
     from openframe.core.exceptions import OpenFrameError
-
-    app = app  # type: FastAPI
 
     def _respond(exc: BaseException, correlation_id: str | None) -> JSONResponse:
         envelope = build_envelope(exc, correlation_id=correlation_id)
@@ -354,6 +385,30 @@ def install_error_handlers(app: Any) -> None:
     ) -> JSONResponse:
         context = build_request_context(dict(request.headers))
         return _respond(exc, context.correlation_id)
+
+    @app.exception_handler(HTTPException)
+    async def _handle_http_exception(request: Request, exc: HTTPException) -> JSONResponse:
+        # A binder-raised HTTPException (bind_query/bind_command's own
+        # not_found_when, bind_webhook's signature-check 401) would
+        # otherwise fall through to FastAPI's own default handler and come
+        # back as {"detail": ...} — a different shape than every other
+        # error this package produces. Mapped into the same envelope here
+        # instead of each binder building its own JSONResponse.
+        context = build_request_context(dict(request.headers))
+        category = _STATUS_TO_CATEGORY.get(exc.status_code)
+        code = category.name if category is not None else f"HTTP_{exc.status_code}"
+        return JSONResponse(
+            status_code=exc.status_code,
+            headers=exc.headers,
+            content={
+                "error": {
+                    "code": code,
+                    "message": str(exc.detail),
+                    "retryable": False,
+                    "correlation_id": context.correlation_id,
+                }
+            },
+        )
 
     @app.exception_handler(Exception)
     async def _handle_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
@@ -396,6 +451,7 @@ def create_app(
     on_shutdown: Callable[[], Awaitable[None]],
     routers: Sequence[APIRouter] = (),
     degraded_mode_exceptions: tuple[type[BaseException], ...] = (AdapterConnectionError, ValidationError),
+    manage_telemetry: bool = True,
 ) -> FastAPI:
     """
     Build a `FastAPI` app with the lifespan/middleware/error-handler shape
@@ -431,6 +487,17 @@ def create_app(
                       every migrated service already used:
                       `AdapterConnectionError` (backend not reachable yet)
                       and pydantic's `ValidationError` (bad settings).
+        manage_telemetry: `True` (the default) calls `setup_telemetry()`/
+                      `shutdown_telemetry()` itself, same as always. Pass
+                      `False` when a composition root runs HTTP and gRPC
+                      concurrently in one process (see the top-level
+                      README's "Multiple entrypoints" section) — both
+                      `create_app` and `create_server` otherwise each call
+                      `setup_telemetry`/`shutdown_telemetry`, so whichever
+                      transport's lifespan exits first tears down the
+                      telemetry providers the other is still using. With
+                      `False`, the composition root calls them itself,
+                      once, around both transports' own lifetimes.
 
     Returns:
         A `FastAPI` instance with `TelemetryMiddleware` added,
@@ -442,19 +509,32 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        setup_telemetry()
-        record_lifecycle_event("cold_start")
+        if manage_telemetry:
+            setup_telemetry()
+            record_lifecycle_event("cold_start")
         try:
             await on_startup()
         except degraded_mode_exceptions as exc:
             _logger.warning(
                 "%s: dependency not ready at startup: %s — running in degraded mode", title, exc
             )
+        except BaseException:
+            # A non-degraded on_startup failure stops the app before
+            # `yield` — without this, shutdown_telemetry() (below the
+            # yield) is never reached and the telemetry providers
+            # setup_telemetry() just started leak.
+            if manage_telemetry:
+                shutdown_telemetry()
+            raise
         yield
         await on_shutdown()
-        shutdown_telemetry()
+        if manage_telemetry:
+            shutdown_telemetry()
 
-    app = FastAPI(title=title, description=description, lifespan=lifespan)
+    # FastAPI's own `description` defaults to "" (not Optional) — passing
+    # None through unchanged was accepted at runtime but a real type
+    # mismatch against its actual signature, caught once mypy ran.
+    app = FastAPI(title=title, description=description or "", lifespan=lifespan)
     app.add_middleware(TelemetryMiddleware)
     install_error_handlers(app)
     for router in routers:

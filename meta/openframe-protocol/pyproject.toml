@@ -4,20 +4,21 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openframe-protocol"
-version = "0.2.0"
+version = "0.4.0"
 description = "OpenFrame Microservice Suite - communication protocol meta-package. Install transports by name or group."
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 keywords = ["openframe", "protocol", "hexagonal", "microservice"]
 dependencies = [
-    "openframe-protocol-base>=0.1,<1",
+    "openframe-protocol-base>=0.4,<1",
 ]
 
 [project.optional-dependencies]
-http      = ["openframe-protocol-http>=0.1,<1"]
-grpc      = ["openframe-protocol-grpc>=0.1,<1"]
-all       = ["openframe-protocol[http]", "openframe-protocol[grpc]"]
+http      = ["openframe-protocol-http>=0.9,<1"]
+grpc      = ["openframe-protocol-grpc>=0.4,<1"]
+media     = ["openframe-protocol-media>=0.1,<1"]
+all       = ["openframe-protocol[http]", "openframe-protocol[grpc]", "openframe-protocol[media]"]
 
 [[project.authors]]
 name = "Furious Meteors Engineering"

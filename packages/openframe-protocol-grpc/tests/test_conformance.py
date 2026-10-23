@@ -17,11 +17,9 @@ from __future__ import annotations
 
 import grpc
 import pytest
-
 from openframe.protocol.base.errors import ErrorCategory
 from openframe.protocol.base.testing import DriverResult, TransportConformanceTests
-from openframe.protocol.grpc import ROUTE_METADATA_KEY
-from openframe.protocol.grpc import generic_pb2, generic_pb2_grpc
+from openframe.protocol.grpc import ROUTE_METADATA_KEY, generic_pb2, generic_pb2_grpc
 
 
 class _GrpcDriver:

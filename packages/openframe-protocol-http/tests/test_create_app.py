@@ -17,7 +17,6 @@ from __future__ import annotations
 from fastapi import APIRouter
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
-
 from openframe.core.exceptions import AdapterConnectionError
 from openframe.protocol.http import create_app
 

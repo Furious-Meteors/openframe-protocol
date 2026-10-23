@@ -38,7 +38,10 @@ from typing import TYPE_CHECKING
 from openframe.protocol.grpc import generic_pb2, generic_pb2_grpc
 
 if TYPE_CHECKING:
-    from openframe.protocol.grpc.client import GrpcRemoteCommandClient, GrpcRemoteQueryClient
+    from openframe.protocol.grpc.client import (
+        GrpcRemoteCommandClient,
+        GrpcRemoteQueryClient,
+    )
     from openframe.protocol.grpc.server import (
         ROUTE_METADATA_KEY,
         GrpcSession,
@@ -48,13 +51,13 @@ if TYPE_CHECKING:
     )
 
 __all__ = [
+    "ROUTE_METADATA_KEY",
+    "GrpcRemoteCommandClient",
+    "GrpcRemoteQueryClient",
+    "GrpcSession",
     "bind_service",
     "bind_service_stream",
-    "GrpcSession",
-    "ROUTE_METADATA_KEY",
     "create_server",
-    "GrpcRemoteQueryClient",
-    "GrpcRemoteCommandClient",
     "generic_pb2",
     "generic_pb2_grpc",
 ]

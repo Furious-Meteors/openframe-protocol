@@ -28,27 +28,42 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from openframe.protocol.http.server import bind_command, bind_query, create_app, install_error_handlers
-    from openframe.protocol.http.client import HttpRemoteCommandClient, HttpRemoteQueryClient, RequestSpec
+    from openframe.protocol.http.client import (
+        HttpRemoteCommandClient,
+        HttpRemoteQueryClient,
+        RequestSpec,
+    )
+    from openframe.protocol.http.quic import create_quic_config
+    from openframe.protocol.http.server import (
+        bind_command,
+        bind_query,
+        create_app,
+        install_error_handlers,
+    )
     from openframe.protocol.http.sse import SseSession, bind_session
+    from openframe.protocol.http.webhook import (
+        SignatureVerificationError,
+        bind_webhook,
+        verify_hmac_sha256,
+    )
     from openframe.protocol.http.websocket import WebSocketSession, bind_websocket
-    from openframe.protocol.http.webhook import SignatureVerificationError, bind_webhook, verify_hmac_sha256
 
 __all__ = [
-    "bind_query",
-    "bind_command",
-    "install_error_handlers",
-    "create_app",
-    "HttpRemoteQueryClient",
     "HttpRemoteCommandClient",
+    "HttpRemoteQueryClient",
     "RequestSpec",
-    "bind_session",
-    "SseSession",
-    "bind_websocket",
-    "WebSocketSession",
-    "bind_webhook",
-    "verify_hmac_sha256",
     "SignatureVerificationError",
+    "SseSession",
+    "WebSocketSession",
+    "bind_command",
+    "bind_query",
+    "bind_session",
+    "bind_webhook",
+    "bind_websocket",
+    "create_app",
+    "create_quic_config",
+    "install_error_handlers",
+    "verify_hmac_sha256",
 ]
 
 _FROM_SERVER = {"bind_query", "bind_command", "install_error_handlers", "create_app"}
@@ -56,6 +71,7 @@ _FROM_CLIENT = {"HttpRemoteQueryClient", "HttpRemoteCommandClient", "RequestSpec
 _FROM_SSE = {"bind_session", "SseSession"}
 _FROM_WEBSOCKET = {"bind_websocket", "WebSocketSession"}
 _FROM_WEBHOOK = {"bind_webhook", "verify_hmac_sha256", "SignatureVerificationError"}
+_FROM_QUIC = {"create_quic_config"}
 
 
 def __getattr__(name: str):
@@ -84,4 +100,11 @@ def __getattr__(name: str):
         from openframe.protocol.http import webhook
 
         return getattr(webhook, name)
+    if name in _FROM_QUIC:
+        # Its own [quic] extra (hypercorn[h3]) — not [server]. Most
+        # services never need QUIC, and hypercorn/aioquic are a
+        # meaningfully heavier dependency than FastAPI alone.
+        from openframe.protocol.http import quic
+
+        return getattr(quic, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

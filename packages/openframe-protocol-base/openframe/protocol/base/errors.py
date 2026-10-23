@@ -36,8 +36,8 @@ from openframe.core.exceptions import (
 __all__ = [
     "ErrorCategory",
     "ErrorEnvelope",
-    "categorize",
     "build_envelope",
+    "categorize",
     "raise_for_envelope",
 ]
 
@@ -238,7 +238,7 @@ def raise_for_envelope(category: ErrorCategory, envelope: ErrorEnvelope, *, remo
     # adapter, operation, cause) — confirmed directly, not assumed:
     # retryable/correlation_id are NOT constructor kwargs despite being
     # real OpenFrameError attributes, so they're set after construction.
-    exc = exc_class(envelope.message, adapter=remote_name, operation="call")
+    exc = exc_class(envelope.message, adapter=remote_name, operation="call")  # type: ignore[call-arg]  # every AdapterError subclass accepts these; exc_class's static type (type[OpenFrameError]) doesn't
     exc.retryable = envelope.retryable
     exc.correlation_id = envelope.correlation_id
     raise exc

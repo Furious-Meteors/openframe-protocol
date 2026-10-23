@@ -46,14 +46,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, Callable
+from collections.abc import Callable, Sequence
+from typing import Any
 
 from fastapi import APIRouter
-from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
-
 from openframe.core.inbound import CloseReason, RequestContext, SessionHandler
-from openframe.protocol.base.context import build_request_context
+from openframe.protocol.base.context import ContextEnricher, build_request_context
 from openframe.protocol.base.session import open_session, run_opened_session
+from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 
 __all__ = ["WebSocketSession", "bind_websocket"]
 
@@ -117,6 +117,9 @@ def bind_websocket(
     path: str,
     *,
     handler_factory: Callable[[], SessionHandler],
+    context_enricher: ContextEnricher | None = None,
+    allowed_origins: Sequence[str] | None = None,
+    max_message_size: int | None = None,
 ) -> None:
     """
     Register a WebSocket route at *path* backed by a fresh `SessionHandler`
@@ -127,10 +130,29 @@ def bind_websocket(
     becomes a real failed handshake (`websocket.close()` called by
     `open_session` itself via `session.close(CloseReason.ERROR)`), not a
     message sent after the client thinks it's connected.
+
+    `context_enricher`: see `build_request_context`'s own docstring — the
+    hook a service uses to set `principal`/`tenant`, same as
+    `bind_query`/`bind_command`/`bind_session` accept it.
+    `allowed_origins`: if given, a connection whose `Origin` header isn't
+    in this list is rejected with a policy-violation close (1008) before
+    `on_open` even runs — `None` (the default) performs no check, the
+    previous behaviour, since a browser's own same-origin policy isn't a
+    substitute for a server-side allowlist but also isn't always wanted
+    (a non-browser client sends no `Origin` header at all).
+    `max_message_size`: if given, an inbound text frame larger than this
+    (in UTF-8 bytes) closes the connection (1009, "message too big")
+    instead of being passed to `on_event` — `None` performs no check, the
+    previous behaviour, which let an unbounded inbound message reach the
+    handler.
     """
 
     async def endpoint(websocket: WebSocket) -> None:
-        context = build_request_context(dict(websocket.headers))
+        if allowed_origins is not None and websocket.headers.get("origin") not in allowed_origins:
+            await websocket.close(code=1008)
+            return
+
+        context = build_request_context(dict(websocket.headers), context_enricher=context_enricher)
         session = WebSocketSession(websocket=websocket, context=context)
         handler = handler_factory()
 
@@ -161,6 +183,10 @@ def bind_websocket(
                     if session._closed:
                         return
                     data = await websocket.receive_text()
+                    if max_message_size is not None and len(data.encode()) > max_message_size:
+                        await session.close(CloseReason.ERROR)
+                        await websocket.close(code=1009)
+                        return
                     try:
                         yield json.loads(data)
                     except json.JSONDecodeError:

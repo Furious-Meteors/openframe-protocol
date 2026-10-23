@@ -71,21 +71,27 @@ import asyncio
 import contextlib
 import json
 import logging
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Awaitable, Callable
-
-import grpc
-from pydantic import BaseModel, TypeAdapter, ValidationError
+from typing import Any
 
 from openframe.core.exceptions import AdapterConnectionError
 from openframe.core.inbound import CloseReason, RequestContext, SessionHandler
-from openframe.core.telemetry import record_error, record_lifecycle_event, setup_telemetry, shutdown_telemetry
-from openframe.protocol.base.context import build_request_context
+from openframe.core.telemetry import (
+    record_error,
+    record_lifecycle_event,
+    setup_telemetry,
+    shutdown_telemetry,
+)
+from openframe.protocol.base.context import ContextEnricher, build_request_context
 from openframe.protocol.base.errors import ErrorCategory, build_envelope, categorize
 from openframe.protocol.base.session import open_session, send_error_event
 from openframe.protocol.grpc import generic_pb2, generic_pb2_grpc
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
-__all__ = ["bind_service", "bind_service_stream", "GrpcSession", "ROUTE_METADATA_KEY", "create_server"]
+import grpc
+
+__all__ = ["ROUTE_METADATA_KEY", "GrpcSession", "bind_service", "bind_service_stream", "create_server"]
 
 _logger = logging.getLogger(__name__)
 
@@ -125,25 +131,25 @@ class _RouteRegisteringServicer(generic_pb2_grpc.GenericServiceServicer):
         self._stream_routes[route] = handler
 
     async def Call(
-        self, request: "generic_pb2.GenericRequest", context: grpc.aio.ServicerContext
-    ) -> "generic_pb2.GenericResponse":
+        self, request: generic_pb2.GenericRequest, context: grpc.aio.ServicerContext
+    ) -> generic_pb2.GenericResponse:
         metadata = dict(context.invocation_metadata())
-        route = metadata.get(ROUTE_METADATA_KEY)
-        handler = self._routes.get(route)
+        route: str | None = metadata.get(ROUTE_METADATA_KEY)
+        handler = self._routes.get(route) if route is not None else None
         if handler is None:
             await context.abort(grpc.StatusCode.NOT_FOUND, f"no route bound for {route!r}")
-            return  # unreachable: abort() always raises
+            raise AssertionError("unreachable: context.abort() always raises")
         return await handler(request, context)
 
     async def CallStream(
-        self, request_iterator: AsyncIterator["generic_pb2.GenericRequest"], context: grpc.aio.ServicerContext
-    ) -> AsyncIterator["generic_pb2.GenericResponse"]:
+        self, request_iterator: AsyncIterator[generic_pb2.GenericRequest], context: grpc.aio.ServicerContext
+    ) -> AsyncIterator[generic_pb2.GenericResponse]:
         metadata = dict(context.invocation_metadata())
-        route = metadata.get(ROUTE_METADATA_KEY)
-        handler = self._stream_routes.get(route)
+        route: str | None = metadata.get(ROUTE_METADATA_KEY)
+        handler = self._stream_routes.get(route) if route is not None else None
         if handler is None:
             await context.abort(grpc.StatusCode.NOT_FOUND, f"no stream route bound for {route!r}")
-            return  # unreachable: abort() always raises
+            return  # unreachable: abort() always raises — bare return is correct here, this is an async generator (CallStream), not a function returning GenericResponse
         async for response in handler(request_iterator, context):
             yield response
 
@@ -190,6 +196,7 @@ def bind_service(
     handler_factory: Callable[[], Any],
     input_model: Any = None,
     not_found_when: Callable[[Any], bool] | None = None,
+    context_enricher: ContextEnricher | None = None,
 ) -> None:
     """
     Register one route's handler on *server*, callable by a client that
@@ -231,11 +238,11 @@ def bind_service(
     adapter = TypeAdapter(input_model) if input_model is not None else None
 
     async def _handle(
-        request: "generic_pb2.GenericRequest", context: grpc.aio.ServicerContext
-    ) -> "generic_pb2.GenericResponse":
+        request: generic_pb2.GenericRequest, context: grpc.aio.ServicerContext
+    ) -> generic_pb2.GenericResponse:
         handler = handler_factory()
         metadata = dict(context.invocation_metadata())
-        request_context: RequestContext = build_request_context(metadata)
+        request_context: RequestContext = build_request_context(metadata, context_enricher=context_enricher)
         context.set_trailing_metadata((("x-correlation-id", request_context.correlation_id),))
 
         try:
@@ -249,13 +256,19 @@ def bind_service(
                 adapter.validate_python(raw_input) if adapter is not None and raw_input is not None else raw_input
             )
             result = await handler.execute(handler_input, request_context)
-        except BaseException as exc:
+        except asyncio.CancelledError:
+            # A cancellation (client disconnect, server shutdown) is not a
+            # handler failure — let it propagate so grpc.aio's own
+            # cancellation handling runs, instead of reporting it to the
+            # client as an INTERNAL error via _abort_for_exception.
+            raise
+        except Exception as exc:
             await _abort_for_exception(context, exc, request_context.correlation_id)
-            return  # unreachable: _abort_for_exception always raises
+            raise AssertionError("unreachable: _abort_for_exception always raises")
 
         if not_found_when is not None and not_found_when(result):
             await context.abort(grpc.StatusCode.NOT_FOUND, "not found")
-            return  # unreachable
+            raise AssertionError("unreachable: context.abort() always raises")
 
         return generic_pb2.GenericResponse(json_payload=json.dumps(_to_jsonable(result)))
 
@@ -285,7 +298,7 @@ class GrpcSession:
 
     def __init__(self, *, context: RequestContext) -> None:
         self.context = context
-        self._queue: "asyncio.Queue[Any]" = asyncio.Queue()
+        self._queue: asyncio.Queue[Any] = asyncio.Queue()
         self._closed = False
         self.close_reason: CloseReason | None = None
 
@@ -308,6 +321,7 @@ def bind_service_stream(
     *,
     handler_factory: Callable[[], SessionHandler],
     input_model: Any = None,
+    context_enricher: ContextEnricher | None = None,
 ) -> None:
     """
     Register one bidirectional-streaming route's `SessionHandler` on
@@ -342,10 +356,10 @@ def bind_service_stream(
     adapter = TypeAdapter(input_model) if input_model is not None else None
 
     async def _handle_stream(
-        request_iterator: AsyncIterator["generic_pb2.GenericRequest"], context: grpc.aio.ServicerContext
-    ) -> AsyncIterator["generic_pb2.GenericResponse"]:
+        request_iterator: AsyncIterator[generic_pb2.GenericRequest], context: grpc.aio.ServicerContext
+    ) -> AsyncIterator[generic_pb2.GenericResponse]:
         metadata = dict(context.invocation_metadata())
-        session = GrpcSession(context=build_request_context(metadata))
+        session = GrpcSession(context=build_request_context(metadata, context_enricher=context_enricher))
         handler = handler_factory()
 
         try:
@@ -480,11 +494,13 @@ async def _abort_for_exception(
 async def create_server(
     *,
     address: str,
-    configure: Callable[["grpc.aio.Server"], None],
+    configure: Callable[[grpc.aio.Server], None],
     on_startup: Callable[[], Awaitable[None]],
     on_shutdown: Callable[[], Awaitable[None]],
     degraded_mode_exceptions: tuple[type[BaseException], ...] = (AdapterConnectionError, ValidationError),
-) -> AsyncIterator["grpc.aio.Server"]:
+    stop_grace: float | None = 5.0,
+    manage_telemetry: bool = True,
+) -> AsyncIterator[grpc.aio.Server]:
     """
     Async context manager yielding a started `grpc.aio.Server`, with the
     same telemetry-setup / degraded-mode-startup / telemetry-shutdown shape
@@ -506,6 +522,17 @@ async def create_server(
         on_shutdown: Awaited after the `with` block exits, before
                      `server.stop()`.
         degraded_mode_exceptions: Same default pair `create_app` uses.
+        stop_grace:  Seconds `server.stop()` waits for in-flight RPCs to
+                     finish before cancelling them outright. `None` stops
+                     immediately (grpc.aio's own default meaning) — the
+                     previous unconditional behaviour, now opt-in.
+        manage_telemetry: `True` (the default) calls `setup_telemetry()`/
+                     `shutdown_telemetry()` itself, same as always. Pass
+                     `False` when a composition root runs HTTP and gRPC
+                     concurrently in one process — see `create_app`'s own
+                     `manage_telemetry` docstring for the full reasoning
+                     (both functions otherwise tear down the same shared
+                     telemetry providers independently).
 
     Usage::
 
@@ -517,29 +544,42 @@ async def create_server(
         ) as server:
             await server.wait_for_termination()
     """
-    setup_telemetry()
-    record_lifecycle_event("cold_start")
+    if manage_telemetry:
+        setup_telemetry()
+        record_lifecycle_event("cold_start")
 
     server = grpc.aio.server()
-    configure(server)
-
     try:
-        await on_startup()
-    except degraded_mode_exceptions as exc:
-        _logger.warning("dependency not ready at startup: %s — running in degraded mode", exc)
+        configure(server)
 
-    port = server.add_insecure_port(address)
-    # Stashed the same way bind_service's own _get_or_create_servicer already
-    # stashes _openframe_generic_servicer on the server — the real bound
-    # port matters when address ends in ":0" (an OS-assigned port, the
-    # pattern every other conformance test in this repo uses for an
-    # isolated, parallel-safe test server). A fixed real address doesn't
-    # need this at all; it's here for exactly that ephemeral-port case.
-    server._openframe_bound_port = port  # type: ignore[attr-defined]
-    await server.start()
+        try:
+            await on_startup()
+        except degraded_mode_exceptions as exc:
+            _logger.warning("dependency not ready at startup: %s — running in degraded mode", exc)
+
+        port = server.add_insecure_port(address)
+        # Stashed the same way bind_service's own _get_or_create_servicer
+        # already stashes _openframe_generic_servicer on the server — the
+        # real bound port matters when address ends in ":0" (an
+        # OS-assigned port, the pattern every other conformance test in
+        # this repo uses for an isolated, parallel-safe test server). A
+        # fixed real address doesn't need this at all; it's here for
+        # exactly that ephemeral-port case.
+        server._openframe_bound_port = port  # type: ignore[attr-defined]
+        await server.start()
+    except BaseException:
+        # configure() or a non-degraded on_startup() failed after
+        # setup_telemetry() already ran — without this, the telemetry
+        # providers it started are never torn down, since the `finally`
+        # below (which owns shutdown_telemetry()) is never reached.
+        if manage_telemetry:
+            shutdown_telemetry()
+        raise
+
     try:
         yield server
     finally:
         await on_shutdown()
-        await server.stop(None)
-        shutdown_telemetry()
+        await server.stop(stop_grace)
+        if manage_telemetry:
+            shutdown_telemetry()

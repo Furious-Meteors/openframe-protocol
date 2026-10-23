@@ -16,10 +16,8 @@ import json
 
 import grpc
 import pytest
-
 from openframe.core.exceptions import AdapterTimeoutError
 from openframe.core.inbound import CloseReason
-from openframe.protocol.base.session import send_error_event
 from openframe.protocol.grpc import bind_service_stream, generic_pb2, generic_pb2_grpc
 
 
@@ -173,7 +171,10 @@ async def test_client_disconnect_reaches_on_close() -> None:
             await asyncio.sleep(10)
             yield generic_pb2.GenericRequest(json_payload=json.dumps("never"))
 
-        call = stub.CallStream(req_gen(), metadata=(("x-openframe-route", "echo"),))
+        # Held, not awaited directly — grpc.aio's call object owns the RPC's
+        # lifetime; letting it get garbage collected here would cancel the
+        # stream before the sleep/close below gets a chance to.
+        call = stub.CallStream(req_gen(), metadata=(("x-openframe-route", "echo"),))  # noqa: F841
         await asyncio.sleep(0.2)  # give the server time to reach open_session/accept
         await channel.close()
 

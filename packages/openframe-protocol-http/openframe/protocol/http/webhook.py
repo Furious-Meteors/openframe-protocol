@@ -47,15 +47,16 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
-from typing import Any, Callable
+import time
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from openframe.core.inbound import RequestContext
+from openframe.protocol.base.context import ContextEnricher, build_request_context
 from pydantic import BaseModel
 
-from openframe.core.inbound import RequestContext
-from openframe.protocol.base.context import build_request_context
-
-__all__ = ["bind_webhook", "verify_hmac_sha256", "SignatureVerificationError"]
+__all__ = ["SignatureVerificationError", "bind_webhook", "verify_hmac_sha256"]
 
 _logger = logging.getLogger(__name__)
 
@@ -100,6 +101,11 @@ def bind_webhook(
     secret: str,
     verify: Callable[..., None] = verify_hmac_sha256,
     status_code: int = 200,
+    context_enricher: ContextEnricher | None = None,
+    max_body_size: int | None = None,
+    timestamp_header: str | None = None,
+    replay_window_seconds: float = 300.0,
+    is_replay: Callable[[str], Awaitable[bool]] | None = None,
 ) -> None:
     """
     Register a POST route at *path* backed by a `CommandHandler`/`UseCase`,
@@ -128,6 +134,43 @@ def bind_webhook(
                           own.
         status_code:      Defaults to 200 — most webhook providers just
                           need an ack, not a particular response shape.
+        max_body_size:    Rejects (413) a request whose body exceeds this
+                          many bytes, checked against `Content-Length`
+                          *before* the body is read, and again against the
+                          actual bytes read (a sender can omit or lie about
+                          `Content-Length`, or use chunked transfer, which
+                          has none at all). `None` (the default) performs
+                          no check — the previous behaviour, which read an
+                          unbounded body into memory before anything else
+                          ran.
+        timestamp_header: If given, the request header carrying a Unix
+                          timestamp (seconds) the sender signed alongside
+                          the body — checked to be within
+                          `replay_window_seconds` of now *before* signature
+                          verification runs, rejecting (401) a request
+                          whose timestamp is missing, unparseable, or too
+                          old/far in the future. `None` (the default)
+                          performs no check, since not every provider
+                          sends one (GitHub/Shopify's own scheme doesn't;
+                          Stripe's does, as `Stripe-Signature`'s own
+                          `t=...` field).
+        replay_window_seconds: How far from now `timestamp_header`'s value
+                          may be, in either direction. Only meaningful
+                          when `timestamp_header` is given.
+        is_replay:        An optional `(signature) -> bool` hook (awaited)
+                          checked *after* signature verification succeeds
+                          — return `True` if this exact signature has
+                          already been accepted, rejecting the request
+                          (401) instead of invoking the handler again. A
+                          timestamp window alone only bounds *how long* a
+                          captured request stays replayable, not whether
+                          it's replayed within that window; this is a
+                          dedup hook, not a dedup *implementation* — this
+                          stateless binder has nowhere of its own to keep
+                          a "seen signatures" set, so the caller supplies
+                          one (a cache, a database row, whatever already
+                          exists for this service). `None` (the default)
+                          performs no check, the previous behaviour.
 
     A missing or invalid signature returns 401 **before** `body_model`
     validation or the handler ever runs — a sender that can't prove who
@@ -136,17 +179,42 @@ def bind_webhook(
     """
 
     async def endpoint(request: Request, __handler__: Any = Depends(handler_dep)) -> Any:
+        if max_body_size is not None:
+            content_length = request.headers.get("content-length")
+            if content_length is not None and content_length.isdigit() and int(content_length) > max_body_size:
+                raise HTTPException(status_code=413, detail="webhook payload too large")
+
         raw_body = await request.body()
+        if max_body_size is not None and len(raw_body) > max_body_size:
+            # Content-Length was absent, non-numeric, or understated (e.g.
+            # chunked transfer) — the check above couldn't catch this one.
+            raise HTTPException(status_code=413, detail="webhook payload too large")
+
         signature = request.headers.get(signature_header)
         if signature is None:
             raise HTTPException(status_code=401, detail="missing webhook signature")
+
+        if timestamp_header is not None:
+            raw_timestamp = request.headers.get(timestamp_header)
+            if raw_timestamp is None:
+                raise HTTPException(status_code=401, detail="missing webhook timestamp")
+            try:
+                sent_at = float(raw_timestamp)
+            except ValueError:
+                raise HTTPException(status_code=401, detail="invalid webhook timestamp") from None
+            if abs(time.time() - sent_at) > replay_window_seconds:
+                raise HTTPException(status_code=401, detail="webhook timestamp outside replay window")
+
         try:
             verify(secret=secret, raw_body=raw_body, signature=signature)
         except SignatureVerificationError:
             raise HTTPException(status_code=401, detail="invalid webhook signature") from None
 
+        if is_replay is not None and await is_replay(signature):
+            raise HTTPException(status_code=401, detail="webhook already processed")
+
         body = body_model.model_validate_json(raw_body)
-        context: RequestContext = build_request_context(dict(request.headers))
+        context: RequestContext = build_request_context(dict(request.headers), context_enricher=context_enricher)
         return await __handler__.execute(body, context)
 
     router.add_api_route(path, endpoint, methods=["POST"], status_code=status_code)

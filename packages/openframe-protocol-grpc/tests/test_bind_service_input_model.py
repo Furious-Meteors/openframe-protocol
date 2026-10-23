@@ -11,9 +11,13 @@ from __future__ import annotations
 
 import grpc
 import pytest
+from openframe.protocol.grpc import (
+    ROUTE_METADATA_KEY,
+    bind_service,
+    generic_pb2,
+    generic_pb2_grpc,
+)
 from pydantic import BaseModel
-
-from openframe.protocol.grpc import ROUTE_METADATA_KEY, bind_service, generic_pb2, generic_pb2_grpc
 
 
 class _Item(BaseModel):

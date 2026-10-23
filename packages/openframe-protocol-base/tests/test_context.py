@@ -8,9 +8,8 @@ the real SDK, not a stand-in for it.
 """
 from __future__ import annotations
 
-from opentelemetry import propagate, trace
-
 from openframe.protocol.base.context import build_request_context
+from opentelemetry import propagate, trace
 
 
 def test_correlation_id_from_incoming_traceparent_header(span_exporter) -> None:

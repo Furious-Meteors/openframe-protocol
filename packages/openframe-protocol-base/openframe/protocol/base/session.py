@@ -64,7 +64,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import AsyncIterator, TypeVar
+from collections.abc import AsyncIterator
+from typing import TypeVar
 
 from openframe.core.inbound import CloseReason, Session, SessionHandler
 from openframe.protocol.base.errors import build_envelope

@@ -8,7 +8,6 @@ binding failure.
 from __future__ import annotations
 
 import pytest
-
 from openframe.core.exceptions import AdapterConnectionError, AdapterTimeoutError
 from openframe.protocol.base.errors import ErrorCategory, build_envelope
 from openframe.protocol.base.testing import (

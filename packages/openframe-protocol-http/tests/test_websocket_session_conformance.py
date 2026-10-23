@@ -12,8 +12,6 @@ import json
 import pytest
 from fastapi import APIRouter, FastAPI
 from fastapi.testclient import TestClient
-from starlette.websockets import WebSocketDisconnect
-
 from openframe.core.exceptions import AdapterTimeoutError
 from openframe.core.inbound import CloseReason
 from openframe.protocol.base.errors import categorize
@@ -23,6 +21,7 @@ from openframe.protocol.base.session_testing import (
     SessionResult,
 )
 from openframe.protocol.http import bind_websocket, install_error_handlers
+from starlette.websockets import WebSocketDisconnect
 
 
 def _build_app(handler_factory):

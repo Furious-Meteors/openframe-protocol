@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from fastapi import APIRouter, FastAPI
 from httpx import ASGITransport, AsyncClient
-
 from openframe.protocol.http import bind_query, install_error_handlers
 
 
@@ -38,7 +37,12 @@ async def test_not_found_detail_includes_handler_input() -> None:
     client = AsyncClient(transport=ASGITransport(app=app, raise_app_exceptions=False), base_url="http://test")
     response = await client.get("/items/abc")
     assert response.status_code == 404
-    assert response.json()["detail"] == "Item 'abc' not found"
+    # The {"error": {...}} envelope every other error returns, not
+    # FastAPI's own {"detail": ...} shape — install_error_handlers now
+    # maps HTTPException through it too (see install_error_handlers's own
+    # docstring for why bind_query's 404 needs the same shape a handler's
+    # own AdapterNotFoundError would produce).
+    assert response.json()["error"]["message"] == "Item 'abc' not found"
     await client.aclose()
 
 
@@ -58,5 +62,5 @@ async def test_not_found_detail_defaults_to_generic_message() -> None:
     client = AsyncClient(transport=ASGITransport(app=app, raise_app_exceptions=False), base_url="http://test")
     response = await client.get("/items/abc")
     assert response.status_code == 404
-    assert response.json()["detail"] == "not found"
+    assert response.json()["error"]["message"] == "not found"
     await client.aclose()

@@ -19,15 +19,14 @@ from __future__ import annotations
 
 import pytest
 from fastapi import APIRouter, FastAPI
-from pydantic import BaseModel
-
 from openframe.core.exceptions import AdapterConnectionError, AdapterTimeoutError
 from openframe.core.middleware import TelemetryMiddleware
 from openframe.core.telemetry import setup_telemetry
 from openframe.core.testing import EchoUseCase, SpyQueryHandler
-from openframe.core.testing.fixtures import *  # noqa: F401,F403
+from openframe.core.testing.fixtures import *
 from openframe.protocol.base.testing import UNEXPECTED_ERROR_SECRET
 from openframe.protocol.http import bind_command, bind_query, install_error_handlers
+from pydantic import BaseModel
 
 
 class _Query(BaseModel):

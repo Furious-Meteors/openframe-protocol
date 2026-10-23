@@ -14,13 +14,15 @@ import hashlib
 import hmac
 import json
 
-import pytest
 from fastapi import APIRouter, FastAPI
 from fastapi.testclient import TestClient
-from pydantic import BaseModel
-
 from openframe.core.exceptions import AdapterConnectionError
-from openframe.protocol.http import bind_webhook, install_error_handlers, verify_hmac_sha256
+from openframe.protocol.http import (
+    bind_webhook,
+    install_error_handlers,
+    verify_hmac_sha256,
+)
+from pydantic import BaseModel
 
 SECRET = "shh-its-a-secret"
 
@@ -157,6 +159,163 @@ def test_invalid_body_after_valid_signature_returns_422() -> None:
     )
     assert resp.status_code == 422
     assert handler.received == []
+
+
+def test_body_over_max_size_rejected_before_handler_runs() -> None:
+    handler = _RecordingHandler()
+    app = FastAPI()
+    install_error_handlers(app)
+    router = APIRouter()
+    bind_webhook(
+        router,
+        "/webhooks/orders",
+        handler_dep=lambda: handler,
+        body_model=_OrderPaid,
+        signature_header="X-Signature",
+        secret=SECRET,
+        max_body_size=10,
+    )
+    app.include_router(router)
+    client = TestClient(app)
+    body = json.dumps({"order_id": "o-1", "amount": 100}).encode()
+    resp = client.post(
+        "/webhooks/orders",
+        content=body,
+        headers={"X-Signature": _sign(body), "Content-Type": "application/json"},
+    )
+    assert resp.status_code == 413
+    assert handler.received == []
+
+
+def test_body_under_max_size_accepted() -> None:
+    handler = _RecordingHandler()
+    app = FastAPI()
+    install_error_handlers(app)
+    router = APIRouter()
+    bind_webhook(
+        router,
+        "/webhooks/orders",
+        handler_dep=lambda: handler,
+        body_model=_OrderPaid,
+        signature_header="X-Signature",
+        secret=SECRET,
+        max_body_size=10_000,
+    )
+    app.include_router(router)
+    client = TestClient(app)
+    body = json.dumps({"order_id": "o-1", "amount": 100}).encode()
+    resp = client.post(
+        "/webhooks/orders",
+        content=body,
+        headers={"X-Signature": _sign(body), "Content-Type": "application/json"},
+    )
+    assert resp.status_code == 200
+    assert len(handler.received) == 1
+
+
+def _build_app_with_timestamp(handler, *, replay_window_seconds: float = 300.0):
+    app = FastAPI()
+    install_error_handlers(app)
+    router = APIRouter()
+    bind_webhook(
+        router,
+        "/webhooks/orders",
+        handler_dep=lambda: handler,
+        body_model=_OrderPaid,
+        signature_header="X-Signature",
+        secret=SECRET,
+        timestamp_header="X-Timestamp",
+        replay_window_seconds=replay_window_seconds,
+    )
+    app.include_router(router)
+    return app
+
+
+def test_missing_timestamp_rejected_when_timestamp_header_configured() -> None:
+    handler = _RecordingHandler()
+    app = _build_app_with_timestamp(handler)
+    client = TestClient(app)
+    body = json.dumps({"order_id": "o-1", "amount": 100}).encode()
+    resp = client.post(
+        "/webhooks/orders",
+        content=body,
+        headers={"X-Signature": _sign(body), "Content-Type": "application/json"},
+    )
+    assert resp.status_code == 401
+    assert handler.received == []
+
+
+def test_stale_timestamp_outside_replay_window_rejected() -> None:
+    import time
+
+    handler = _RecordingHandler()
+    app = _build_app_with_timestamp(handler, replay_window_seconds=60)
+    client = TestClient(app)
+    body = json.dumps({"order_id": "o-1", "amount": 100}).encode()
+    stale = str(time.time() - 3600)  # one hour old, window is 60s
+    resp = client.post(
+        "/webhooks/orders",
+        content=body,
+        headers={"X-Signature": _sign(body), "Content-Type": "application/json", "X-Timestamp": stale},
+    )
+    assert resp.status_code == 401
+    assert handler.received == []
+
+
+def test_fresh_timestamp_within_replay_window_accepted() -> None:
+    import time
+
+    handler = _RecordingHandler()
+    app = _build_app_with_timestamp(handler, replay_window_seconds=300)
+    client = TestClient(app)
+    body = json.dumps({"order_id": "o-1", "amount": 100}).encode()
+    resp = client.post(
+        "/webhooks/orders",
+        content=body,
+        headers={
+            "X-Signature": _sign(body),
+            "Content-Type": "application/json",
+            "X-Timestamp": str(time.time()),
+        },
+    )
+    assert resp.status_code == 200
+    assert len(handler.received) == 1
+
+
+def test_is_replay_hook_rejects_a_previously_seen_signature() -> None:
+    seen: set[str] = set()
+
+    async def _is_replay(signature: str) -> bool:
+        if signature in seen:
+            return True
+        seen.add(signature)
+        return False
+
+    handler = _RecordingHandler()
+    app = FastAPI()
+    install_error_handlers(app)
+    router = APIRouter()
+    bind_webhook(
+        router,
+        "/webhooks/orders",
+        handler_dep=lambda: handler,
+        body_model=_OrderPaid,
+        signature_header="X-Signature",
+        secret=SECRET,
+        is_replay=_is_replay,
+    )
+    app.include_router(router)
+    client = TestClient(app)
+    body = json.dumps({"order_id": "o-1", "amount": 100}).encode()
+    headers = {"X-Signature": _sign(body), "Content-Type": "application/json"}
+
+    first = client.post("/webhooks/orders", content=body, headers=headers)
+    assert first.status_code == 200
+    assert len(handler.received) == 1
+
+    second = client.post("/webhooks/orders", content=body, headers=headers)
+    assert second.status_code == 401
+    assert len(handler.received) == 1, "replayed delivery must not reach the handler a second time"
 
 
 def test_custom_verify_with_no_prefix() -> None:

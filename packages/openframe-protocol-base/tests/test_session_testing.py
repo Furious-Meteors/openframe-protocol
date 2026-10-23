@@ -11,9 +11,8 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-
 from openframe.core.exceptions import AdapterTimeoutError
-from openframe.core.inbound import CloseReason, RequestContext
+from openframe.core.inbound import RequestContext
 from openframe.core.testing import InMemorySession
 from openframe.protocol.base.errors import categorize
 from openframe.protocol.base.session import run_session

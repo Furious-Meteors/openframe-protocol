@@ -25,14 +25,18 @@ from __future__ import annotations
 import json
 from typing import Any, Generic, TypeVar
 
+from openframe.core.inbound import RequestContext
+from openframe.protocol.base.errors import (
+    ErrorCategory,
+    ErrorEnvelope,
+    raise_for_envelope,
+)
+from openframe.protocol.grpc import generic_pb2, generic_pb2_grpc
+from openframe.protocol.grpc.server import ROUTE_METADATA_KEY, _to_jsonable
+
 import grpc
 
-from openframe.core.inbound import RequestContext
-from openframe.protocol.base.errors import ErrorCategory, ErrorEnvelope, raise_for_envelope
-from openframe.protocol.grpc import generic_pb2, generic_pb2_grpc
-from openframe.protocol.grpc.server import ROUTE_METADATA_KEY
-
-__all__ = ["GrpcRemoteQueryClient", "GrpcRemoteCommandClient"]
+__all__ = ["GrpcRemoteCommandClient", "GrpcRemoteQueryClient"]
 
 TInput = TypeVar("TInput")
 TOutput = TypeVar("TOutput")
@@ -53,7 +57,7 @@ class _GrpcRemoteCallMixin:
         *,
         target: str | None = None,
         route: str,
-        channel: "grpc.aio.Channel | None" = None,
+        channel: grpc.aio.Channel | None = None,
         remote_name: str | None = None,
     ) -> None:
         if channel is None and target is None:
@@ -74,7 +78,11 @@ class _GrpcRemoteCallMixin:
         if context is not None:
             metadata.append(("x-correlation-id", context.correlation_id))
 
-        request = generic_pb2.GenericRequest(json_payload=json.dumps(value))
+        # _to_jsonable (same helper bind_service uses on the way out) —
+        # without it, a caller passing a BaseModel (the value every
+        # bind_command/bind_query handler built for -http already accepts)
+        # fails json.dumps with a bare TypeError instead of being sent.
+        request = generic_pb2.GenericRequest(json_payload=json.dumps(_to_jsonable(value)))
 
         try:
             response = await self._stub.Call(request, metadata=tuple(metadata))

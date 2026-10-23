@@ -40,7 +40,7 @@ from typing import Any, Protocol, runtime_checkable
 from openframe.core.inbound import CloseReason
 from openframe.protocol.base.errors import ErrorCategory
 
-__all__ = ["SessionResult", "SessionDriver", "SessionConformanceTests"]
+__all__ = ["SessionConformanceTests", "SessionDriver", "SessionResult"]
 
 
 @dataclass(frozen=True)

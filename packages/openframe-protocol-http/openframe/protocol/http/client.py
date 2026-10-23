@@ -25,16 +25,22 @@ Dependency order:
 """
 from __future__ import annotations
 
+import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Generic, TypeVar
+from typing import Any, Generic, TypeVar
+from urllib.parse import quote
 
 import httpx
+from openframe.core.inbound import RequestContext
+from openframe.protocol.base.errors import (
+    ErrorCategory,
+    ErrorEnvelope,
+    raise_for_envelope,
+)
 from opentelemetry import propagate
 
-from openframe.core.inbound import RequestContext
-from openframe.protocol.base.errors import ErrorCategory, ErrorEnvelope, categorize, raise_for_envelope
-
-__all__ = ["RequestSpec", "HttpRemoteQueryClient", "HttpRemoteCommandClient"]
+__all__ = ["HttpRemoteCommandClient", "HttpRemoteQueryClient", "RequestSpec"]
 
 TInput = TypeVar("TInput")
 TOutput = TypeVar("TOutput")
@@ -44,6 +50,11 @@ _STATUS_TO_CATEGORY: dict[int, ErrorCategory] = {
     422: ErrorCategory.INVALID,
     504: ErrorCategory.TIMEOUT,
     503: ErrorCategory.UNAVAILABLE,
+    # 429 (rate limited) and 502 (bad gateway) are both transient,
+    # retry-worthy failures of the remote side, not "this request is
+    # malformed" — the same bucket as 503, not the INTERNAL default.
+    429: ErrorCategory.UNAVAILABLE,
+    502: ErrorCategory.UNAVAILABLE,
 }
 
 
@@ -94,7 +105,14 @@ class _HttpRemoteCallMixin:
     ) -> None:
         if client is None and base_url is None:
             raise ValueError("Either base_url or an existing client must be provided.")
-        self._client = client if client is not None else httpx.AsyncClient(base_url=base_url)
+        if client is not None:
+            self._client = client
+        else:
+            # base_url is guaranteed non-None here (the check above raises
+            # otherwise) — asserted so mypy can narrow it, not just for
+            # runtime safety.
+            assert base_url is not None
+            self._client = httpx.AsyncClient(base_url=base_url)
         self._owns_client = client is None
         self._path = path
         self._method = method
@@ -108,7 +126,12 @@ class _HttpRemoteCallMixin:
 
     async def _call(self, value: Any, context: RequestContext | None) -> Any:
         spec = self._build_request(value)
-        url = self._path.format(**spec.path_params) if spec.path_params else self._path
+        # Path params are substituted into a URL template, not free text —
+        # an unescaped value (e.g. containing "/" or "..") would otherwise
+        # change the request path FastAPI's own router sees, not just the
+        # value inside it.
+        path_params = {k: quote(str(v), safe="") for k, v in spec.path_params.items()}
+        url = self._path.format(**path_params) if path_params else self._path
 
         headers: dict[str, str] = {}
         propagate.inject(headers)  # outgoing traceparent — joins the inbound trace, if any is active
@@ -125,7 +148,12 @@ class _HttpRemoteCallMixin:
             raise AdapterTimeoutError(
                 f"Timed out calling {self._remote_name}", adapter=self._remote_name, operation="call", cause=exc
             ) from exc
-        except httpx.ConnectError as exc:
+        except httpx.TransportError as exc:
+            # Catches everything else httpx raises for a failed exchange —
+            # ConnectError (already handled before this was broadened),
+            # ReadError, WriteError, RemoteProtocolError, ProxyError — all
+            # of which previously escaped as a raw httpx exception instead
+            # of the AdapterError every caller is told to expect.
             from openframe.core.exceptions import AdapterConnectionError
 
             raise AdapterConnectionError(
@@ -138,8 +166,14 @@ class _HttpRemoteCallMixin:
             return response.json()
 
         category = _STATUS_TO_CATEGORY.get(response.status_code, ErrorCategory.INTERNAL)
-        body = response.json() if response.content else {}
-        error = body.get("error", body)
+        try:
+            body = response.json() if response.content else {}
+        except (json.JSONDecodeError, ValueError):
+            # A proxy's own error page (HTML 502, plain-text 429) isn't
+            # this service's envelope — fall back to an empty body rather
+            # than letting a JSONDecodeError mask the real HTTP failure.
+            body = {}
+        error = body.get("error", body) if isinstance(body, dict) else {}
         envelope = ErrorEnvelope(
             code=error.get("code", "unknown"),
             message=error.get("message", f"{self._remote_name} failed with status {response.status_code}"),
