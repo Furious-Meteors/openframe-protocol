@@ -39,9 +39,10 @@ below.
 Not yet published to PyPI — install from this repo directly (editable installs of the sibling
 packages, or build local wheels) until a first release ships. `openframe-protocol-base` is at
 **0.4.2**, `openframe-protocol-http` at **0.11.0**, `openframe-protocol-grpc` at **0.4.2**,
-`openframe-protocol-media` at **0.2.0**. All four develop and test against
-`openframe-core>=3.2.1,<4` (`openframe-core` itself is at **3.9.0** — `openframe-protocol-media`
-specifically needs `>=3.9.0` for `openframe.core.media.MediaFrame`/`MediaKind`).
+`openframe-protocol-media` at **0.4.0**. All four develop and test against
+`openframe-core>=3.2.1,<4` (`openframe-core` itself is at **3.10.0** — `openframe-protocol-media`
+specifically needs `>=3.10.0` for `openframe.core.media.MediaFrame`/`MediaKind`/`MediaSegment`,
+the last of which is new in 3.10.0 and used by the HLS/DASH pull-ingest capabilities below).
 
 Both transports can run **concurrently in one process, over the same business logic** — a real
 service in `openframe-local-validation-framework` serves HTTP and gRPC side by side, sharing the
@@ -91,7 +92,7 @@ pip install "openframe-protocol[all]"     # every transport package, base includ
 | (default) | `openframe-protocol-base` | **0.4.2** — error mapping, `RequestContext` construction, request/response + session conformance suites, `open_session`/`run_opened_session`/`send_error_event` | `openframe-core` |
 | `[http]` | `openframe-protocol-http` | **0.11.0** — `bind_query`/`bind_command`/`create_app`/`bind_session`/`bind_websocket`/`bind_webhook` (`[server]`), `create_quic_config` (`[quic]`, HTTP/3 over QUIC — no `bind_quic`, every binder works unchanged), `HttpRemoteQueryClient`/`HttpRemoteCommandClient` (`[client]`) | `openframe-protocol-base` |
 | `[grpc]` | `openframe-protocol-grpc` | **0.4.2** — `bind_service`/`bind_service_stream`/`create_server` (`[server]`), `GrpcRemoteQueryClient`/`GrpcRemoteCommandClient` (`[client]`) | `openframe-protocol-base` |
-| `[media]` | `openframe-protocol-media` | **0.2.0** — `bind_ingest`/`create_server`/`RtmpRegistry`/`RtmpSession` (`[ingest]`, RTMP over `pyrtmp`), `bind_hls_delivery`/`bind_dash_delivery`/`bind_media_delivery` (`[delivery]`, HLS/DASH over fastapi, with Range support), `MediaFlowController`/`DropPolicy`/`FlowConfig`/`MediaRequest`/`MediaObject`/`parse_range_header` (no extra — zero third-party deps) | `openframe-protocol-base`, `openframe-core>=3.9.0` |
+| `[media]` | `openframe-protocol-media` | **0.4.0** — `bind_ingest`/`create_server`/`RtmpRegistry`/`RtmpSession` (`[ingest]`, RTMP over `pyrtmp`), `pull_hls`/`HlsPullSession`/`pull_dash`/`DashPullSession` (`[pull]`, HLS + DASH pull ingest over `httpx` + `m3u8` + `mpegdash`), `bind_hls_delivery`/`bind_dash_delivery`/`bind_media_delivery` (`[delivery]`, HLS/DASH over fastapi, with Range support), `MediaFlowController`/`DropPolicy`/`FlowConfig`/`MediaRequest`/`MediaObject`/`parse_range_header` (no extra — zero third-party deps) | `openframe-protocol-base`, `openframe-core>=3.10.0` |
 
 `TransportConformanceTests` and `RemoteClientConformanceTests` (`openframe-protocol-base`) both
 pass for real against **two** transports — the rule-of-three bar the project's own design spec
