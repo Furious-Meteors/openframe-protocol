@@ -35,7 +35,7 @@ from openframe.core.inbound import CloseReason
 from openframe.protocol.media import bind_dash_delivery, pull_dash
 from uvicorn import Config, Server
 
-FFMPEG = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
+FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
 
 pytestmark = pytest.mark.skipif(not shutil.which("ffmpeg"), reason="real ffmpeg not installed")
 

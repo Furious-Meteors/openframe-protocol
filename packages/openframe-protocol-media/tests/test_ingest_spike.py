@@ -14,9 +14,9 @@ from openframe.core.inbound import CloseReason
 from openframe.core.media import MediaFrame, MediaKind
 from openframe.protocol.media import bind_ingest, create_server
 
-FFMPEG = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
+FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
 
-pytestmark = pytest.mark.skipif(not shutil.which("ffmpeg") and FFMPEG is None, reason="ffmpeg not available")
+pytestmark = pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg not available")
 
 
 class _RecordingHandler:
