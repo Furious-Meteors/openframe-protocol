@@ -72,9 +72,20 @@ jobs:
           ls -lh dist/
 
       - name: Publish to PyPI
+        # Trusted Publishing (OIDC), per this job's own `permissions:
+        # id-token: write` above and the comment explaining it — no
+        # `password:` input. Passing `secrets.PYPI_API_TOKEN` here as well
+        # (the previous state of this step) made the job look OIDC-based
+        # while actually authenticating with a long-lived token instead,
+        # since gh-action-pypi-publish prefers an explicit password over
+        # ambient OIDC when both are present. Requires a trusted publisher
+        # already registered for each package at
+        # https://pypi.org/manage/project/<package-name>/settings/publishing/
+        # (PyPI's "pending publisher" feature supports registering one for
+        # a package that hasn't been published yet) before the next push
+        # to `production` — confirm that's done, or this step will fail.
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: ${{ matrix.package }}/dist/
-          password: ${{ secrets.PYPI_API_TOKEN }}
           skip-existing: true
           attestations: false

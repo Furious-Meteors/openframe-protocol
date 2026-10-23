@@ -26,6 +26,7 @@ jobs:
           - openframe-protocol-base
           - openframe-protocol-http
           - openframe-protocol-grpc
+          - openframe-protocol-media
 
     defaults:
       run:
@@ -60,6 +61,116 @@ jobs:
 
       - name: Install ${{ matrix.package }} with dev dependencies
         run: pip install -e ".[dev]"
+
+      - name: Run tests
+        run: python -m pytest tests/ -v --tb=short --cov=openframe --cov-report=term-missing
+
+  lint-and-typecheck:
+    name: "${{ matrix.package }} — ruff + mypy"
+    runs-on: ubuntu-latest
+    # One Python version, not the full matrix above — lint/type-check
+    # results don't vary meaningfully across 3.11-3.14 for this codebase,
+    # and running them four times each would just slow CI down for no
+    # real coverage gain.
+
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - openframe-protocol-base
+          - openframe-protocol-http
+          - openframe-protocol-grpc
+          - openframe-protocol-media
+
+    defaults:
+      run:
+        working-directory: packages/${{ matrix.package }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install openframe-protocol-base from this checkout (not on PyPI yet)
+        working-directory: ${{ github.workspace }}
+        run: pip install -e packages/openframe-protocol-base
+
+      - name: Install ${{ matrix.package }} with dev dependencies
+        run: pip install -e ".[dev]"
+
+      - name: ruff check
+        # Picks up the repo-root pyproject.toml's [tool.ruff] (generated
+        # protobuf files excluded, BLE001/B008 ignored as documented
+        # deliberate idioms there) via ruff's own upward config search —
+        # no per-package config needed.
+        run: ruff check .
+
+      - name: mypy
+        # --namespace-packages/--explicit-package-bases: these packages are
+        # PEP 420 namespace packages (openframe.protocol.http, etc., no
+        # __init__.py at the openframe/ or openframe/protocol/ level) —
+        # without both flags mypy can't map file paths to module names at
+        # all and fails immediately on the first file it looks at.
+        run: mypy openframe --ignore-missing-imports --namespace-packages --explicit-package-bases
+
+  test-lowest-versions:
+    name: "${{ matrix.package }} — lowest declared floors"
+    runs-on: ubuntu-latest
+    # Catches exactly the version-floor drift that let pyproject.toml claim
+    # openframe-core>=3.2.1/openframe-protocol-base>=0.1 while the code
+    # actually imported symbols (SessionHandler, session.py) that only
+    # exist from 3.8.0/0.4.0 — a floor pip would happily resolve to on a
+    # clean install, and the `test` job above never catches, since it
+    # always installs whatever pip's resolver picks (effectively latest).
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: openframe-protocol-http
+            core-floor: "3.8.0"
+            base-floor: "0.4.0"
+          - package: openframe-protocol-grpc
+            core-floor: "3.8.0"
+            base-floor: "0.4.0"
+          - package: openframe-protocol-media
+            core-floor: "3.10.0"
+            base-floor: "0.4.0"
+
+    defaults:
+      run:
+        working-directory: packages/${{ matrix.package }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install openframe-protocol-base at its floor from this checkout
+        working-directory: ${{ github.workspace }}
+        run: pip install -e packages/openframe-protocol-base
+
+      - name: Install the package with every dependency pinned to its declared floor
+        run: |
+          pip install -e ".[dev]" \
+            "openframe-core==${{ matrix.core-floor }}" \
+            "openframe-protocol-base==${{ matrix.base-floor }}"
 
       - name: Run tests
         run: python -m pytest tests/ -v --tb=short

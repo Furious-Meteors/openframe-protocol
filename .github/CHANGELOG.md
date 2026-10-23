@@ -4,6 +4,537 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [openframe-protocol-http 0.11.1] - 2026-10-19
+
+### Fixed — `install_error_handlers`'s `HTTPException` handler dropped `exc.headers`
+
+Flagged twice during the `openframe-protocol-media` build: `_handle_http_exception` rebuilt a raised
+`HTTPException` into the shared `{"error": {...}}` envelope using only `status_code`/`content` on the
+`JSONResponse`, silently dropping `exc.headers` — unlike FastAPI's own default `HTTPException` handler,
+which does propagate them. No current binder in this repo happened to raise an `HTTPException` with
+headers attached, so this went unnoticed in practice until `openframe-protocol-media`'s delivery binder
+specifically had to route around it (returning a raw `Response` for a 416 instead of raising
+`HTTPException`, to avoid losing the required `Content-Range` header) rather than depend on it being
+fixed. Now passes `headers=exc.headers` through — `None` is a safe no-op (confirmed: both
+`HTTPException.headers` and `JSONResponse`'s own `headers` parameter already treat `None` as "nothing
+extra"), so this is purely additive for every existing caller. 2 new regression tests.
+
+---
+
+## [openframe-protocol-media 0.4.0] - 2026-10-19
+
+### Added — DASH pull ingest, the fourth and final planned capability, completing the set alongside RTMP ingest (push), HLS/DASH delivery (serve), and HLS pull ingest (poll)
+
+`pull_dash`/`DashPullSession` (`dash_pull.py`, same `[pull]` extra as HLS pull, now also pulling
+in `mpegdash>=0.4`) — the DASH counterpart to `hls_pull.py`: polls a remote DASH *origin* we do
+not control (a live MPD), parses it, and feeds newly-appeared segments
+(`openframe.core.media.MediaSegment`) into a `SessionHandler` (ADR-008). Architecturally
+identical to `pull_hls` (same outbound-HTTP-poll shape, same `Session`/`SessionHandler` wiring,
+same `http_client` injection point, same `CloseReason.CLIENT_DISCONNECT`-never-used narrowing) —
+only the manifest format and URL-resolution logic differ.
+
+Built on a real spike this session against real `ffmpeg` DASH output (`-f dash -seg_duration 2
+-window_size 5 -use_template 1 -use_timeline 1`) and the real `mpegdash` 0.4.1 library — not a
+clean-room design from the DASH-IF spec or `mpegdash`'s own README:
+
+- **`mpegdash` does zero URL resolution of any kind** — confirmed by reading its actual
+  installed source (`mpegdash/nodes.py`): `SegmentTemplate.media`/`.initialization` and
+  `S.t`/`.d`/`.r` are plain strings/ints, no substitution logic anywhere in the library.
+  Confirmed live: `media="chunk-stream$RepresentationID$-$Number%05d$.m4s"` comes back as that
+  raw placeholder string. `pull_dash` hand-writes resolution for both `$Number[%0Nd]$` and
+  `$Time[%0Nd]$` forms, plus `$RepresentationID$` — a resolver handling only one of
+  `$Number$`/`$Time$` would silently do nothing useful against the other.
+- **A `SegmentTimeline`'s `<S t= d= r=>` elements must be walked per-element, independently —
+  never assumed to be "one `<S>` with `r=N-1`".** Confirmed by the real spike: the AUDIO track's
+  timeline split into multiple separate `<S>` elements with DIFFERENT `d` values each (AAC
+  frame-boundary rounding), while the VIDEO track happened to produce one clean `<S t= r=N-1>`.
+  The implemented algorithm iterates every `<S>` in document order, carrying a running
+  `current_time` forward across elements that omit `t=` (confirmed: every `<S>` after the first
+  omits it in real output) and a running `number` counter seeded from `SegmentTemplate
+  .startNumber` (default `1`), expanding each `<S>`'s own `r` into `r + 1` segments spaced by
+  that `<S>`'s own `d`. Verified byte-for-byte against the real spike's own ffmpeg output with
+  zero mismatches.
+- **Everything `mpegdash` hands back untyped needs hand-written parsing** — confirmed: every
+  duration/dateTime MPD attribute (`availabilityStartTime`, `minimumUpdatePeriod`,
+  `suggestedPresentationDelay`, …) is parsed by `mpegdash` with plain `str`, zero interpretation.
+  A small `datetime.fromisoformat`-based parser (after normalising a trailing `Z`) handles the
+  datetime fields; a narrow hand-rolled regex handles the simple `PT<seconds>S` duration form
+  real ffmpeg output exclusively used, raising clearly on anything richer rather than silently
+  mis-parsing. No `isodate`-style third-party dependency pulled in for this.
+- **Live-edge formula, confirmed against real numbers**: `live_edge_seconds = (now_utc -
+  availability_start_time).total_seconds() - suggested_presentation_delay_seconds` — the
+  subtraction is load-bearing (without it, the computed edge points past the last actually
+  available segment). In practice, "starting near the live edge" falls out naturally from
+  processing everything in the first fetched MPD, since `ffmpeg -window_size N` already prunes
+  the `SegmentTimeline` itself to a live sliding window before `pull_dash` ever sees it — the
+  same reasoning `hls_pull.py` already applies to HLS's own sliding-window media playlist.
+- **DASH DOES have a clean, reliable end-of-stream signal — a correction to the assumption DASH
+  was weaker here than HLS.** A real clean `ffmpeg` stop flips the MPD root's `type` attribute
+  from `"dynamic"` to `"static"` and drops every live-only attribute from the root. `pull_dash`
+  maps `mpd.type == "static"` (re-checked on every poll) to `CloseReason.COMPLETED` — the direct
+  DASH-native analogue of HLS's `#EXT-X-ENDLIST`. A real hard kill, confirmed separately, leaves
+  the manifest completely untouched (`type="dynamic"`, every live attribute intact) — caught
+  instead via the same `max_stale_polls`-style no-advance timeout heuristic as `hls_pull.py`,
+  for `CloseReason.ERROR`.
+- **DASH has no per-segment discontinuity signal of any kind — not even an opt-in one**, unlike
+  HLS's `#EXT-X-DISCONTINUITY`. `pull_dash`'s own sequence-gap-inferred discontinuity (the same
+  mechanism `hls_pull.py` uses as a robustness addition on top of the origin's own flag) is
+  therefore the ONLY discontinuity signal available here at all.
+- **Manifest re-fetch cadence derives directly from `minimumUpdatePeriod`** (confirmed equal to
+  `-seg_duration` in real output), used as-is rather than halved the way `hls_pull.py` halves
+  `#EXT-X-TARGETDURATION` — the origin already states its own "poll me this often" value here.
+  Diffing between fetches fully re-runs the `<S>`-expansion algorithm into concrete
+  `(number, time, duration)` tuples every poll and diffs those against a per-representation
+  `highest_number_processed` watermark — never a raw XML/`<S>`-element diff, confirmed necessary
+  since an `r=N` timeline can re-shape across polls (one segment rolling in/out can re-split or
+  re-merge `<S>` elements) even though only one segment actually changed.
+
+**Scope decisions** (explicit, not bugs — mirroring `hls_pull.py`'s own master-playlist
+exclusion): single `Period` only; no multi-bitrate rendition selection (first `Representation`
+per `AdaptationSet` used, logged) while every `AdaptationSet` IS handled naturally (video + audio
+both, confirmed the common real-ffmpeg case, each independently sequenced via
+`representation_id`); no init-segment (`initialization=`) fetch, since demuxing a CMAF track is
+explicitly a downstream adapter's job, not this package's; `SegmentList`/`SegmentBase`
+representations are skipped with a warning (`SegmentTemplate` + `SegmentTimeline` only).
+
+Verified against: 14 pure unit tests of the resolution algorithm (including the audio-track
+independent-`<S>`-elements case against hand-constructed fixtures), 5 controlled gap-detection/
+stale-timeout/clean-close tests, 6 conformance tests against a real local server built on this
+package's own `bind_dash_delivery`, and 1 real end-to-end spike test against real `ffmpeg` DASH
+output over a ~40s live window with a real clean stop — all passing, zero regressions against
+the existing 259 passed / 2 xfailed monorepo baseline.
+
+---
+
+## [openframe-protocol-media 0.3.0] - 2026-10-19
+
+### Added — HLS pull ingest, a third architecturally distinct capability alongside RTMP ingest (push) and HLS/DASH delivery (serve)
+
+`pull_hls`/`HlsPullSession` (`hls_pull.py`, needs the new `[pull]` extra: `httpx>=0.27` +
+`m3u8>=6.0`) — polls a remote HLS *origin* we do not control (a live/sliding-window media
+playlist), parses it, and feeds newly-appeared segments
+(`openframe.core.media.MediaSegment`, new in `openframe-core` 3.10.0, the dependency floor this
+release bumps to) into a `SessionHandler` (ADR-008). Outbound HTTP polling, not an inbound
+connection of any kind — the first capability in this package built on a self-initiated
+background loop rather than something connecting to us.
+
+Built on two real spikes this session against real `ffmpeg` HLS output and the real `m3u8`
+6.0.0 + `httpx` 0.28.1 libraries, including a real encoder restart and a real `SIGKILL` of the
+origin — not a clean-room design from the HLS spec:
+
+- **Dedup/ordering key is `media_sequence`, never the segment URI.** `m3u8` assigns
+  `segment.media_sequence` to every segment itself (confirmed by reading its source), reliable
+  across 50 real rotations with zero misses or duplicates. URIs are explicitly unsafe to dedup
+  on — confirmed real: an unrelated encoder/stream restart can reset filename counters, so two
+  different segments can share a URI.
+- **`m3u8` has no `reload()`/diff method** — this module fetches playlist text itself via an
+  injected/owned `httpx.AsyncClient` (never `m3u8.load(url)`, which would own its own HTTP
+  stack), parses fresh each poll with `m3u8.loads()`, and diffs against a locally-tracked
+  highest-sequence-processed watermark itself.
+- **`segment.current_program_date_time`, not the sparse `segment.program_date_time`, is the
+  field to read.** Confirmed: ffmpeg's own default `-f hls` emits no `#EXT-X-PROGRAM-DATE-TIME`
+  tags at all; `current_program_date_time` is `m3u8`'s own backfilled value and was populated far
+  more often in the spike.
+- **Discontinuity must be inferred, not just read off the origin's tag.** Confirmed by actually
+  restarting a real encoder with a resolution/GOP change into the same stream: zero
+  `#EXT-X-DISCONTINUITY` tags appeared without the origin explicitly configuring `ffmpeg`'s own
+  `-hls_flags +discont_start`. `pull_hls` independently infers a discontinuity whenever its own
+  sequence-gap detection fires, OR'd with the origin's own flag.
+- **Polling too slowly silently drops segments with zero errors raised anywhere** — confirmed:
+  polling at roughly the full sliding-window duration (not the target duration) missed 22% of
+  real segments, the only symptom being `media_sequence` jumping by more than 1 between polls.
+  `poll_interval=None` therefore derives a default from the first fetched playlist's own
+  `#EXT-X-TARGETDURATION` (half of it — confirmed safe: 1s against a real 2s target duration,
+  zero misses across 50 rotations), falling back to a conservative hardcoded 2.0s only if the
+  manifest declares no target duration at all.
+- **A clean stream end and a hard origin crash are two completely different signals, needing two
+  completely different detections.** `#EXT-X-ENDLIST` reliably means the stream ended on purpose
+  -> `CloseReason.COMPLETED`. A real `SIGKILL`-equivalent against a real origin produced *no*
+  signal whatsoever — the raw playlist text was confirmed byte-for-byte identical before and
+  after the kill. `max_stale_polls` (default 10) counts consecutive polls with no sequence
+  advance; exceeding it raises inside the poll loop, which `run_opened_session` maps to
+  `CloseReason.ERROR`.
+- **`SessionHandler`'s own contract is mechanically reusable for a self-initiated poll loop** —
+  confirmed by direct design research this session: ADR-008's own "forward a Kafka consumer into
+  an open session" example is the same shape. One deliberate narrowing: `CloseReason
+  .CLIENT_DISCONNECT` is never used by this transport — there is no remote peer to disconnect
+  from when this side is the one polling.
+- **`HlsPullSession.send()` has no outbound wire channel at all** (unlike RTMP's `onStatus`) — a
+  `MediaSegment` is recorded for same-process handoff, and an in-band error mapping is logged
+  rather than delivered, matching `send_error_event`'s own documented "never make a failing
+  session worse" contract rather than re-raising into it.
+- `http_client` mirrors `HttpRemoteQueryClient`'s (`openframe.protocol.http.client`) own
+  inject-or-build-default convention exactly, confirmed by reading its real `_owns_client`/
+  `aclose()` logic: an injected client is never closed by `pull_hls`, enabling a caller to attach
+  custom auth headers, rotate credentials mid-stream, or fail over across CDNs via a custom
+  `httpx.AsyncBaseTransport` — the entire reason this capability belongs in `-media` rather than
+  just pointing `ffmpeg -i` at the remote URL directly.
+- **Scope**: a single-rendition HLS *media* playlist only. A *master* playlist (multiple variant
+  streams, needing a `rendition_selector`) is explicitly out of scope for this release.
+- `tests/test_hls_pull_gap_detection.py` proves the gap/discontinuity-inference, stale-poll
+  timeout, and `#EXT-X-ENDLIST` behaviours deterministically, against a hand-rolled local HTTP
+  server serving hand-written playlist fixtures (no real-ffmpeg timing dependency).
+  `tests/test_hls_pull_spike.py` re-runs the real spike as a test — real `ffmpeg` producing a
+  genuinely live/rotating playlist (`-hls_time 2 -hls_list_size 5 -hls_flags delete_segments`)
+  served over a real local server via this package's own `bind_hls_delivery`, polled by the real
+  `pull_hls` binding for ~40s, asserting strictly increasing sequence order, zero duplicates, and
+  a clean `CloseReason.COMPLETED` after stopping ffmpeg. `tests/test_hls_pull_conformance.py`
+  runs `SessionConformanceTests` (`openframe-protocol-base`) against the real binding, reusing
+  `bind_hls_delivery` as the real origin server — a fifth real transport to pass this suite, and
+  the first outbound-poller one; `ordered_delivery` is a genuinely *stronger* signal here than for
+  RTMP ingest's own weaker onStatus-description bridge, since real segments are really fetched in
+  real sequence order; `abrupt_disconnect` is `xfail`'d with a documented reason (no remote peer
+  to disconnect from), the same honest-not-papered-over treatment RTMP ingest's own conformance
+  suite gives its own unfalsifiable case.
+- Dependency floor: `openframe-core>=3.10.0,<4` (up from `>=3.9.0,<4`), needed for
+  `openframe.core.media.MediaSegment`.
+
+---
+
+## [openframe-protocol-media 0.2.0] - 2026-10-19
+
+### Added — HLS/DASH delivery, the read side completing this package's RTMP ingest (0.1.0)
+
+Serving already-produced manifest/segment files over HTTP with full Range support.
+Transcoding/segmenting/packaging is explicitly out of scope (a separate ffmpeg-based adapter the
+wider platform builds handles that) — this is bytes-that-already-exist delivery only.
+
+- **`types.py` — `MediaRequest`/`MediaObject`/`MediaRange`/`MediaProfile`/`MediaObjectKind`/
+  `HLS_PROFILE`/`DASH_PROFILE`/`MediaCachePolicy`/`MediaCorsPolicy`**: pure-stdlib vocabulary, no
+  `fastapi` import anywhere — a service's own `QueryHandler` implementation can spell
+  `MediaRequest`/`MediaObject` in its type annotations without installing the new `[delivery]`
+  extra at all, the same "no extra dependency for a plain type" shape `flow.py` already established
+  for the ingest half. `MediaRequest.range` is passed down to the handler and
+  `MediaObject.served_range`/`total_size` come back up, deliberately — a top-rung ABR segment can be
+  ~15MB and a real player seeks constantly, so a binder that fetched whole objects and sliced them
+  itself would materialize the full object on every single seek, and would make a genuinely
+  range-aware storage read (`S3 GetObject(Range=...)`, `os.pread()`) unreachable from this package
+  entirely.
+- **`ranges.py` — `parse_range_header`/`resolve_range`/`UnsatisfiableRangeError`**: RFC 9110
+  §14.1.2/§14.2 byte-range parsing, pure stdlib. All three `bytes=` forms
+  (`start-end`/`start-`/`-suffix_length`) resolved precisely; a non-`bytes` unit, a multi-range
+  request, or malformed syntax is treated as "ignore it, serve 200" per the RFC's own permission to
+  do so (multi-range support was deliberately skipped — a media player only ever requests one
+  contiguous range at a time in practice); a well-formed-but-out-of-bounds range (a zero-length
+  suffix, or a start at/beyond the object's real size) raises `UnsatisfiableRangeError`, the one
+  case that really is a 416. Exhaustively unit-tested in `tests/test_ranges.py`, including the exact
+  boundary (`start == total_size - 1` satisfiable vs. `start == total_size` not).
+- **`delivery.py` — `bind_media_delivery`/`bind_hls_delivery`/`bind_dash_delivery`**: wires a
+  `QueryHandler[MediaRequest, MediaObject]` (`openframe.core.inbound`) to a real FastAPI GET/HEAD
+  route (plus an OPTIONS preflight route), needs the new `[delivery]` extra (`fastapi>=0.110`).
+  Binds a `QueryHandler`, not a new source abstraction — a `MediaSource` port would be an outbound
+  port belonging in `openframe-core`'s `ports/outbound/` per ADR-006's intake rule, not invented
+  here; the handler decides whether bytes come from S3, a local mount, or a cache, keeping this
+  package's "protocol never sees a repository" philosophy intact. Depends on `openframe-protocol-base`
+  + `fastapi` directly, **never** on `openframe-protocol-http` — the seam is a plain `APIRouter`, a
+  service wires both into `create_app(..., routers=(api_router, media_router))` itself, and the
+  ingest half of this same package needs no ASGI stack at all, so a package-wide `-http` dependency
+  would be dead weight for half of what this package does. An unrecognised suffix 404s before the
+  handler is ever called — content type is matched against `profile.suffixes`, never guessed. A 416
+  response is built as a raw `Response` with `Content-Range: bytes */<size>` set directly, **never**
+  raised as `HTTPException` — read directly from the installed `openframe-protocol-http` source
+  (not guessed): `_handle_http_exception` builds its `JSONResponse` without passing
+  `headers=exc.headers`, silently dropping any headers attached to a raised `HTTPException`, which
+  would lose exactly the one header RFC 9110 §14.4 requires a 416 to carry. This package never wires
+  that handler (see above), so the bug is structurally unreachable here rather than merely avoided —
+  documented as a separate, future drive-by fix for `-http` itself, not addressed in this release.
+  `Cache-Control` defaults to `no-cache` for manifests (a live-edge manifest changes every time a new
+  segment is produced) and a one-year `immutable` cache for segments/init files (written once under
+  a name that never changes). `ETag`/`Last-Modified` are passed through only when the handler
+  actually sets them — never synthesized by this binder. A handler-reported `served_range`/body width
+  that doesn't match the resolved request range raises `ValueError`, surfacing as a `500` — correctly,
+  since that's a storage-layer bug, not a client error.
+- `tests/test_bind_media_delivery.py` exercises all of the above end to end against a real FastAPI
+  app and `httpx.AsyncClient` (`ASGITransport`, matching `-http`'s own `test_conformance.py`
+  pattern) bound to a fake in-memory `QueryHandler`: 200/206/404/416/500 status codes, all three
+  Range forms, `HEAD` (empty body, correct headers), per-kind `Cache-Control`, CORS headers on
+  success/404/OPTIONS preflight, and the 416-carries-`Content-Range` regression test proving the
+  `-http` bug above is actually routed around, not just described.
+- `pyproject.toml` gained the `delivery` extra (`fastapi>=0.110`) and `dev` gained `fastapi`/`httpx`
+  (for `TestClient`/`AsyncClient`), without touching the existing `ingest`/`dev` entries; package
+  bumped to 0.2.0 as a real feature addition, not a patch. `.github/workflows/app-test.yml` already
+  listed `openframe-protocol-media` in all three matrices from the 0.1.0 (ingest) release and needed
+  no changes — `[dev]` already installs everything both halves of this package need.
+
+---
+
+## [openframe-protocol-media 0.1.0] - 2026-10-19
+
+### Added — RTMP ingest, the first binary-payload transport in the family, built on a real `pyrtmp` + `ffmpeg` spike
+
+New package, `openframe-protocol-media`. Everything but SSE/WebSocket/gRPC so far has moved
+JSON-shaped events; RTMP ingest moves raw audio/video bytes, and `pyrtmp` 0.3.1 (the only
+maintained pure-Python asyncio RTMP server implementation found) turned out to diverge from its
+own README in several places significant enough to shape this package's whole structure. Nothing
+below was assumed from the RTMP spec — every claim was confirmed by spiking against a real
+`pyrtmp` server and real `ffmpeg`, and in three cases, by directly reproducing a real bug.
+
+- **`flow.py` — `MediaFlowController`/`DropPolicy`/`FlowConfig`/`FlowStats`/`BackPressureExceeded`/
+  `MediaGap`**: transport-neutral, zero-third-party-dependency back-pressure between a binary media
+  producer and whatever consumes `MediaFrame`s downstream (`openframe.core.media`, added in
+  `openframe-core` 3.9.0). Hysteresis-based `pause()`/`resume()` callbacks at configurable byte
+  watermarks; under sustained overflow, the default `DropPolicy.DROP_VIDEO_UNTIL_KEYFRAME` sheds
+  non-config video interframes until a fresh keyframe arrives *and* the buffer has drained back
+  below the low watermark (both conditions, confirmed required independently — a keyframe alone
+  isn't enough), then resumes with a `MediaGap` marker. A config frame (`is_config=True`) is never
+  dropped under **any** policy, with zero exceptions — the single invariant this package treats as
+  non-negotiable, since losing one can make a whole stream undecodable with no recovery short of a
+  new session. Built on a plain `collections.deque` + `asyncio.Event`, not `asyncio.Queue` —
+  `Queue.put_nowait` can't do byte-budgeted eviction or keyframe-aware shedding, and `offer()` must
+  stay synchronous (it's called directly from a `pyrtmp` callback, not an awaiting coroutine).
+  Proven under genuine sustained back-pressure (not just unit-level): `tests/test_backpressure.py`
+  pushes ~100MB of synthetic frames through an 8MiB-scale budget against a deliberately slow
+  consumer and asserts the byte ceiling, zero audio/config drops, and post-gap keyframe invariants
+  all hold for real.
+- **`ingest.py` — `RtmpSession`/`RtmpRegistry`/`bind_ingest`/`create_server`**: wires a
+  `SessionHandler` (ADR-008) to a real `pyrtmp`-backed RTMP publish connection. Three genuinely
+  surprising, spike-confirmed `pyrtmp` behaviours shaped this module directly: (1) a plain `raise`
+  from `on_ns_publish` sends **nothing** to the client — rejecting for real requires hand-building
+  an AMF0 `onStatus(level="error")` message, since there is no built-in reject helper; (2)
+  `self.transport` does not exist on the controller at all — the real `asyncio.Transport` is
+  `session.writer.transport`, confirmed by reading `pyrtmp`'s own `SessionManager`; (3) `cleanup()`,
+  not `on_stream_closed`, is the *only* teardown hook called on every disconnect path, clean or
+  crashed — `connection_lost(exc)` was `exc=None` for both a real SIGTERM and a real SIGKILL during
+  the spike, so crash vs. clean stop cannot be reliably told apart here, and this binding always
+  reports `CloseReason.COMPLETED` rather than guessing (a known, accepted, documented limitation,
+  not an oversight). A fourth bug was found and fixed while building the conformance suite, not by
+  inspection: `RtmpSession.close()` originally closed the TCP writer eagerly, but
+  `openframe.protocol.base.session.open_session`'s own reject path calls `session.close()` *before*
+  re-raising — racing the subsequent hand-built rejection write against an already-closing socket,
+  confirmed by reproducing a real `ConnectionResetError`. `RtmpSession.close()` now only tracks the
+  idempotent closed flag; real teardown is left to `pyrtmp`'s own unconditional `writer.close()`
+  after `cleanup()` returns.
+- **`SessionConformanceTests` (`openframe-protocol-base`) passes against this binding** — the fourth
+  real transport to prove it, after SSE/WebSocket and gRPC — via a minimal hand-rolled RTMP publish
+  client (`pyrtmp` itself ships no client). One scenario is a confirmed, documented exception:
+  `test_abrupt_disconnect_closes_with_client_disconnect` is marked `xfail` — not weakened or
+  skipped — because this binding can never report `CLIENT_DISCONNECT` (see `cleanup()`'s own
+  limitation above); `ordered_delivery`/`correlation_id_stable` are driven through the `onStatus`
+  error channel rather than real media frames, a weaker signal than the other transports, documented
+  as such rather than hidden. `tests/test_ingest_spike.py` publishes a few real seconds of
+  H.264+AAC from real `ffmpeg` into a real `create_server`, asserting config frames, a post-config
+  keyframe, and a `COMPLETED` close all land as expected.
+- Root `pyproject.toml`'s `pythonpath`, `meta/openframe-protocol`'s `media` extra (and `all`), and
+  `.github/workflows/app-test.yml`'s `test`/`lint-and-typecheck`/`test-lowest-versions` matrices all
+  updated for the new package.
+- HLS/DASH delivery (the read side) is a later phase — this release is ingest-only.
+
+---
+
+## [openframe-protocol-http 0.11.0] - 2026-10-18
+
+### Added — webhook replay protection and body-size cap, the two items left open from the previous review-driven pass
+
+- **`bind_webhook` gained `max_body_size`**: rejects (413) a request whose body exceeds this many
+  bytes, checked against `Content-Length` *before* the body is read (avoiding reading an unbounded
+  body into memory at all when the sender is honest about its size), and again against the actual
+  bytes read afterward (a sender can omit `Content-Length`, lie about it, or use chunked transfer,
+  which has none at all).
+- **`bind_webhook` gained `timestamp_header`/`replay_window_seconds`**: if a timestamp header is
+  configured, a request whose timestamp is missing, unparseable, or outside the window (default
+  300s either direction) is rejected (401) *before* signature verification runs. Opt-in, since not
+  every provider sends one (GitHub/Shopify's own scheme doesn't; Stripe's does).
+- **`bind_webhook` gained `is_replay`**: an optional `(signature) -> bool` hook (awaited), checked
+  after signature verification succeeds — a timestamp window alone only bounds *how long* a
+  captured, validly-signed request stays replayable, not whether it's replayed within that window.
+  This binder is stateless and has nowhere of its own to keep a "seen signatures" set, so the hook
+  is a dedup *point*, not a dedup *implementation* — the caller supplies the actual store.
+- **`_STATUS_TO_CATEGORY`'s reverse lookup (used by the `HTTPException` handler added in 0.10.0)
+  extended for 400 and 413** — both are "the request itself was malformed," the same bucket 422
+  already occupies, now mapped to `ErrorCategory.INVALID` instead of falling back to a generic
+  `HTTP_400`/`HTTP_413` code. 401/403/409 are deliberately left on the generic fallback — none of
+  the five categories draw an auth/conflict distinction (see `webhook.py`'s own docstring), so
+  forcing one would misrepresent the error rather than clarify it.
+- 9 new tests covering all three new `bind_webhook` parameters.
+
+---
+
+## [tooling] Lint, type-check, and coverage added to CI - 2026-10-18
+
+The last unaddressed item from the external review: `app-test.yml` only ran `pytest`, with no
+lint/type-check/coverage gate at all.
+
+- **New `lint-and-typecheck` CI job** (one Python version per package, not the full 3.11-3.14
+  matrix — these results don't vary meaningfully across versions): `ruff check` and `mypy
+  --ignore-missing-imports --namespace-packages --explicit-package-bases` for all three packages.
+- **A real `[tool.ruff]`/`[tool.ruff.lint]` config added to the repo-root `pyproject.toml`** (ruff
+  finds it via its own upward config search from any package subdirectory) — generated protobuf
+  files (`generic_pb2*.py`) excluded (ruff's own `--fix` rewrote one during this pass, confirmed
+  and reverted — exactly the failure mode the exclude prevents), and `BLE001`/`B008` ignored
+  project-wide: both are deliberate, documented idioms here (the catch-all exception boundary every
+  transport binding maps through `categorize()`/`build_envelope()` at, and FastAPI's own
+  `Depends(...)`-in-a-default-argument pattern), not oversights ruff happened to catch.
+  `ruff format` was deliberately **not** added as a CI gate — a first real run found 43 of ~50
+  files would be reformatted, a large, purely cosmetic diff with real review cost and no
+  correctness value; left for a deliberate separate pass, not folded into this one.
+- **11 real mypy errors fixed** (3 in `-base`, 3 in `-http`, 5 in `-grpc`) surfaced once mypy
+  actually ran — all pre-existing, all latent rather than live bugs (confirmed: full test suite
+  stayed green before and after each fix), including a real signature-type narrowing in
+  `FastAPI(description=...)` (was passed `None`, the real signature defaults to `""`) and three
+  `return` statements after a `context.abort()`/`_abort_for_exception()` call that mypy couldn't
+  know never returns, now `raise AssertionError("unreachable: ...")` instead — clearer intent, and
+  type-checks cleanly without needing a `NoReturn`-typed stub for either.
+- **`pytest-cov` added to `[dev]`**; `Run tests` now reports `--cov=openframe --cov-report=term-missing`
+  (not a hard coverage-percentage gate — no established baseline existed to set one against yet).
+- `py.typed` is unrelated to this entry (added in the previous pass) but is what made adding mypy
+  here meaningful at all.
+
+---
+
+## [openframe-protocol-grpc 0.4.1] - 2026-10-18
+
+### Fixed — correctness/robustness findings from an external code review, all verified against the actual code before fixing
+
+- **`bind_service`'s unary handler no longer catches `asyncio.CancelledError`.** It previously
+  wrapped `handler.execute()` in `except BaseException`, which swallowed a client disconnect or
+  server shutdown and reported it to the client as an `INTERNAL` abort instead of letting the
+  cancellation propagate for `grpc.aio` to handle normally. Narrowed to `except Exception`, with an
+  explicit `except asyncio.CancelledError: raise` ahead of it.
+- **`create_server` no longer leaks telemetry on a failed `configure`/`on_startup`.** `setup_telemetry()`
+  ran unconditionally before `configure(server)`/`start()`; if either raised (a non-degraded
+  exception), the `finally` block owning `shutdown_telemetry()` was never reached. Now wrapped so a
+  failure during setup tears down telemetry before re-raising.
+- **`create_server` gained `stop_grace` (default `5.0`s).** `server.stop(None)` (immediate, no
+  grace period) killed every in-flight RPC on shutdown unconditionally; now configurable, `None`
+  still available for the previous behaviour.
+- **`create_server` gained `manage_telemetry` (default `True`).** `create_app`/`create_server` each
+  call `setup_telemetry()`/`shutdown_telemetry()` independently; a service running both
+  concurrently (see the top-level README's "Multiple entrypoints" example, now updated) had
+  whichever transport's lifespan exited first tear down the telemetry providers the other was still
+  using. `manage_telemetry=False` opts a transport out, letting the composition root own it once.
+- **`GrpcRemoteQueryClient`/`GrpcRemoteCommandClient` now serialise via `_to_jsonable`** (the same
+  helper `bind_service` already used on responses) instead of a bare `json.dumps(value)` — a caller
+  passing a `BaseModel` (the normal input shape for a handler built for `-http`) previously failed
+  with a raw `TypeError` instead of being sent.
+- **`bind_service`/`bind_service_stream` accept `context_enricher`**, threaded through to
+  `build_request_context` — the same `principal`/`tenant` hook `-http`'s binders now all accept.
+- **`protobuf>=5.26` added as an explicit runtime dependency** of both `[server]` and `[client]`.
+  `generic_pb2.py` imports `google.protobuf` directly, but `grpcio` itself declares no protobuf
+  dependency (confirmed: only `typing-extensions`) — a clean install resolving only `grpcio` was
+  missing it; `grpcio-tools` (dev-only) happened to pull it in, masking the gap in tests.
+- **Dependency floors corrected**: `openframe-core>=3.2.1` → `>=3.8.0` (where `SessionHandler`/
+  `CloseReason` actually land, imported directly by this package) and `openframe-protocol-base>=0.1`
+  → `>=0.4` (where `session.py` itself was added) — the previous floors resolved to a release
+  missing symbols this package imports unconditionally.
+- Added `py.typed` (the `"Typing :: Typed"` classifier had nothing backing it).
+- New CI job (`app-test.yml`): installs this package with every dependency pinned to its newly
+  corrected floor and runs the suite against it — the gap that let the floor drift above go
+  unnoticed by CI in the first place.
+
+---
+
+## [openframe-protocol-http 0.10.0] - 2026-10-18
+
+### Fixed — correctness/robustness findings from an external code review, all verified against the actual code before fixing
+
+- **`HttpRemoteQueryClient`/`HttpRemoteCommandClient` no longer leak raw `httpx` exceptions.**
+  `_call` only caught `httpx.TimeoutException` and `httpx.ConnectError`; broadened the second to
+  `httpx.TransportError` (its actual base class), which also covers `ReadError`, `WriteError`,
+  `RemoteProtocolError`, and `ProxyError` — all previously escaped unmapped, contradicting this
+  package's own "callers only see `AdapterError`" contract.
+- **The client no longer crashes on a non-JSON error body.** `response.json()` on an error response
+  had no guard; a proxy's own HTML 502 page raised `JSONDecodeError` instead of a normal
+  `AdapterError`. Now caught, falling back to an empty body.
+- **429 (rate limited) and 502 (bad gateway) now map to `ErrorCategory.UNAVAILABLE`** (same bucket
+  as 503) instead of the `INTERNAL` default — both are transient failures of the remote side, not
+  evidence this request was malformed, and the category decides which `AdapterError` subclass the
+  client reconstructs, not just a `retryable` flag.
+- **Path params are now URL-encoded** (`urllib.parse.quote`) before being substituted into a
+  client's path template — an unescaped value (e.g. containing `/` or `..`) previously changed the
+  request path itself, not just the value inside it.
+- **`not_found_when` (`bind_query`/`bind_command`) and `bind_webhook`'s 401s now return the same
+  `{"error": {...}}` envelope every other error does.** Both raised a plain `fastapi.HTTPException`,
+  which FastAPI's own default handler serialises as `{"detail": ...}` — a different, undocumented
+  shape a caller using `raise_for_envelope` couldn't parse. A new `HTTPException` handler in
+  `install_error_handlers` maps it into the envelope via the already-existing status→category table,
+  falling back to `HTTP_<status>` for a status (401) that table doesn't cover.
+- **`create_app`'s lifespan no longer leaks telemetry on a failed `on_startup`.** Same fix as
+  `create_server`'s (above) for the symmetric bug.
+- **`create_app` gained `manage_telemetry` (default `True`)** — see `openframe-protocol-grpc 0.4.1`'s
+  entry above for the shared reasoning; the top-level README's multi-entrypoint example now passes
+  `manage_telemetry=False` to both and owns `setup_telemetry`/`shutdown_telemetry` itself.
+- **`SseSession`'s queue is now bounded** (`queue_maxsize`, default 1000) — unbounded before, a slow
+  or stalled client let a fast-producing handler grow server memory without limit; `send()` now
+  applies natural backpressure once full.
+- **`bind_session` (SSE) sends `Cache-Control: no-cache` and `X-Accel-Buffering: no`** — without
+  them, an intermediary proxy can buffer or cache a stream that was never meant to be either.
+- **`bind_websocket` gained `allowed_origins` and `max_message_size`** (both optional, default
+  `None`/no check — preserves previous behaviour). A connection whose `Origin` header isn't allowed
+  is rejected with a policy-violation close (1008) before `on_open` runs; an inbound text frame over
+  the size limit closes the connection (1009) instead of reaching `on_event` unbounded.
+- **`bind_query`/`bind_command`/`bind_session`/`bind_websocket`/`bind_webhook` all accept
+  `context_enricher`** now, threaded through to `build_request_context` — the seam already existed
+  there but no binder exposed it, making `principal`/`tenant` unreachable without editing this
+  package directly.
+- **A client-supplied `X-Correlation-ID` is now validated before being trusted** — length-capped
+  (128 chars) and required to be printable with no `\r`/`\n`, falling back to a fresh `uuid4`
+  otherwise. Previously reflected back into the response header and every log line/span verbatim,
+  an unbounded log-flooding and (if some downstream consumer builds a raw header line from it)
+  header-injection surface.
+- **Dependency floors corrected**: `openframe-core>=3.2.1` → `>=3.8.0`, `openframe-protocol-base>=0.1`
+  → `>=0.4` — same drift and fix as `openframe-protocol-grpc 0.4.1`'s entry above.
+- Added `py.typed`.
+- New CI job (`app-test.yml`): lowest-declared-floors matrix entry for this package too.
+
+---
+
+## [openframe-protocol-base 0.4.1] - 2026-10-18
+
+### Fixed
+
+- **`ContextEnricher` is now exported** (`openframe.protocol.base.context.__all__`) — every binder
+  in `-http`/`-grpc` that now accepts a `context_enricher` parameter imports it from here.
+- **A client-supplied correlation-id header is now sanity-checked** before `build_request_context`
+  trusts it (see `openframe-protocol-http 0.10.0`'s entry above for the full reasoning) —
+  length-capped and required to be printable with no CR/LF, otherwise a fresh `uuid4` is used.
+- **Dependency floor corrected**: `openframe-core>=3.2.1` → `>=3.8.0` — `session.py` imports
+  `SessionHandler`/`Session`/`CloseReason` directly (ADR-008, landed in core 3.8.0); the previous
+  floor resolved to a core release without them.
+
+---
+
+## [openframe-protocol 0.3.0 (meta)] - 2026-10-18
+
+### Fixed
+
+Stale version table (`base 0.1.0`, `http 0.1.0`, no gRPC row — actual state was 0.4.0/0.8.0/0.4.0
+at the time) and stale extra floors (`openframe-protocol-http>=0.1`, `-grpc>=0.1`, both already past
+1.0-worth of real releases) — both flagged by an external review and confirmed against the real repo
+state. Floors now match each package's own `pyproject.toml`.
+
+---
+
+## [openframe-protocol-http 0.9.0] - 2026-10-18
+
+### Added — `create_quic_config`, HTTP/3 over QUIC via Hypercorn — zero changes to any binder
+
+A new `quic.py` module (alongside `sse.py`/`websocket.py`/`webhook.py`) with its own `[quic]`
+extra (`hypercorn[h3]`), confirmed by a real end-to-end spike, not assumed: a `bind_query`-bound
+route, served via `create_app()`'s unmodified output under a real Hypercorn server configured for
+QUIC, reached by a real HTTP/3 client over a real QUIC connection — status 200, correct body, and
+`build_request_context`'s own correlation-id generation intact, with **zero changes** to
+`bind_query`/`bind_command`/`install_error_handlers`/`create_app` themselves.
+
+- **`create_quic_config(*, bind, certfile, keyfile, alpn_protocols=("h3",))`** — the one genuinely
+  repeatable piece of boilerplate this needed: `quic_bind` must mirror `bind`, and `alpn_protocols`
+  must include `"h3"`, both easy to get wrong by hand and uninteresting enough not to leave
+  copy-pasted in every service. Returns a `hypercorn.Config`; the caller still calls
+  `hypercorn.asyncio.serve(app, config)` and owns the process, the exact same boundary `create_app`
+  already draws for `uvicorn`.
+- **Deliberately no `bind_quic` and no separate package.** QUIC is a transport-layer concern, not a
+  new way an inbound event reaches a handler (unlike SSE/WebSocket/webhooks, each a genuinely new
+  binding shape) — confirmed by the spike itself working with zero binder changes. `uvicorn` has no
+  QUIC support; `hypercorn` does, so this is purely a server-choice decision made in each service's
+  own `main.py`, not a new openframe-protocol concern.
+- Test cert generated with the `cryptography` library directly (no `openssl` subprocess dependency)
+  — a self-signed cert with a proper `SubjectAltName` for `127.0.0.1`/`localhost`, confirmed needed
+  after an earlier spike attempt without SANs hung indefinitely on an unrelated IPv6/`localhost`
+  resolution mismatch between client and server.
+- 1 new test (a full real client/server HTTP/3 round trip). Full monorepo suite: 175 passing (up
+  from 174).
+
+---
+
 ## [openframe-protocol-grpc 0.4.0] - 2026-10-18
 
 ### Added — `bind_service_stream`, the third `SessionHandler` transport, via `grpc.aio`'s native streaming
