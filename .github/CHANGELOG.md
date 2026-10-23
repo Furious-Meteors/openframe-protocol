@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [openframe-protocol-media] CI fix — missing `uvicorn` dev dependency - 2026-10-23
+
+No version bump: this corrects a dependency *declaration* only, not the package's runtime
+behavior — nothing a real consumer of `openframe-protocol-media` imports or depends on changed.
+
+- **Real CI failure**: `tests/test_{hls,dash}_pull_{conformance,spike}.py` each do
+  `from uvicorn import Config, Server` to stand up a real local `bind_hls_delivery`/
+  `bind_dash_delivery` FastAPI app as the test origin that `pull_hls`/`pull_dash` poll against —
+  deliberate real-infrastructure testing, not something to mock around. `uvicorn` was never
+  declared anywhere in this package's own `pyproject.toml` (`ingest`, `delivery`, `pull`, or
+  `dev`), so a clean CI install of `openframe-protocol-media[dev]` failed with
+  `ModuleNotFoundError: No module named 'uvicorn'` across all four files. It worked in local
+  development only because the shared dev venv had picked up `uvicorn` transitively, from
+  `openframe-protocol-http`'s own `[dev]` extras having been installed into the same venv
+  earlier — a classic "worked locally" / clean-install drift.
+- **Fix**: added `uvicorn>=0.30` to `[dev]` only (matching the exact floor already declared in
+  `openframe-protocol-http`'s `[dev]` extra, for consistency across the monorepo) — not to
+  `ingest`/`delivery`/`pull`, since no runtime code path in this package imports it; it is
+  test-only infrastructure.
+- `test-lowest-versions` in `app-test.yml` needed no change: that job only pins
+  `openframe-core`/`openframe-protocol-base` to exact floors and otherwise installs `[dev]`
+  normally, so the new `uvicorn>=0.30` floor resolves the same way there as in the regular `test`
+  job.
+- Verified in a fresh venv with none of the existing shared venv's incidental installs: a clean
+  `pip install -e "packages/openframe-protocol-media[dev]"` now pulls in `uvicorn` on its own
+  (confirmed 0.54.0 resolved), all four previously-erroring files collect and pass, and the full
+  suite runs clean: **103 passed, 3 xfailed**. `ruff check .` and `mypy --ignore-missing-imports
+  --namespace-packages --explicit-package-bases` both still clean. Full monorepo suite
+  (`pytest packages/ -q` from the repo root, original shared venv) confirmed with zero
+  regressions elsewhere.
+
+---
+
 ## [openframe-protocol-http 0.11.1] - 2026-10-19
 
 ### Fixed — `install_error_handlers`'s `HTTPException` handler dropped `exc.headers`

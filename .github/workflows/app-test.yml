@@ -46,6 +46,15 @@ jobs:
       - name: Upgrade pip
         run: python -m pip install --upgrade pip
 
+      # openframe-protocol-media's real-infrastructure spike tests
+      # (test_ingest_spike.py, test_hls_pull_spike.py, test_dash_pull_spike.py)
+      # spawn a real ffmpeg subprocess — confirmed by a real CI failure
+      # (FileNotFoundError resolving ffmpeg) that ubuntu-latest does not
+      # ship ffmpeg preinstalled, not assumed.
+      - name: Install ffmpeg
+        if: matrix.package == 'openframe-protocol-media'
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
       # openframe-protocol-base is not yet published to PyPI (unlike
       # openframe-core/openframe-adapters-*), so pip can't resolve it as a
       # dependency of openframe-protocol-http/-grpc on a clean runner —
@@ -161,6 +170,12 @@ jobs:
 
       - name: Upgrade pip
         run: python -m pip install --upgrade pip
+
+      # See the `test` job's own "Install ffmpeg" step above for why this
+      # is needed for openframe-protocol-media's real-infrastructure spikes.
+      - name: Install ffmpeg
+        if: matrix.package == 'openframe-protocol-media'
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
       - name: Install openframe-protocol-base at its floor from this checkout
         working-directory: ${{ github.workspace }}
