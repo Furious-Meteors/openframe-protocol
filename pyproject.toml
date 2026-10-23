@@ -4,6 +4,34 @@ pythonpath = [
     "packages/openframe-protocol-base",
     "packages/openframe-protocol-http",
     "packages/openframe-protocol-grpc",
+    "packages/openframe-protocol-media",
 ]
 testpaths = ["packages"]
 addopts = "--import-mode=importlib"
+
+[tool.ruff]
+extend-exclude = [
+    # protoc/grpc_tools-generated — "DO NOT EDIT" is in their own header;
+    # ruff's own --fix already rewrote these once before this exclude was
+    # added (confirmed and reverted), which is exactly the failure mode
+    # this guards against.
+    "**/generic_pb2.py",
+    "**/generic_pb2.pyi",
+    "**/generic_pb2_grpc.py",
+]
+
+[tool.ruff.lint]
+ignore = [
+    # Every transport binding in this repo deliberately catches `Exception`
+    # at one specific boundary — mapping any handler failure through
+    # categorize()/build_envelope() (or the SessionHandler equivalent) —
+    # by design, not oversight; each site already documents why in its own
+    # comment. Narrowing it further would mean naming every AdapterError
+    # subclass and every third-party exception type at each site, which is
+    # exactly the isinstance-ladder this architecture exists to avoid.
+    "BLE001",
+    # FastAPI's own `Depends(...)` idiom is a function call in an argument
+    # default by design — the framework's dependency-injection mechanism
+    # depends on it being evaluated at declaration time, not called.
+    "B008",
+]
