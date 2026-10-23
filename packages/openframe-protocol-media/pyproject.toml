@@ -58,6 +58,11 @@ dev = [
     "httpx>=0.27",
     "m3u8>=6.0",
     "mpegdash>=0.4",
+    # Real local uvicorn server used by test_{hls,dash}_pull_{conformance,spike}.py
+    # as a test origin to poll pull_hls/pull_dash against -- not a runtime
+    # dependency of this package, so it belongs only in [dev], not in the
+    # ingest/delivery/pull extras.
+    "uvicorn>=0.30",
     "pytest-cov>=5.0",
     "ruff>=0.17",
     "mypy>=1.13",
